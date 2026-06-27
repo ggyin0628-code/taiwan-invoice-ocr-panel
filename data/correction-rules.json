@@ -1,0 +1,12 @@
+{
+  "sellerNameCorrections": {},
+  "commonDigitCorrections": {
+    "O": "0",
+    "I": "1",
+    "l": "1"
+  },
+  "fieldRules": {
+    "buyerTaxIdCannotEqualInvoiceNumberSuffix": true,
+    "amountCalculatedFromQuantityAndUnitPrice": true
+  }
+}

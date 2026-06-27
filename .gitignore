@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+ocr-service/.venv/
+
+# Build outputs
+.next/
+out/
+dist/
+
+# Local env and secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+!.env.local.example
+
+# Runtime data - keep only empty structure and rules
+data/uploads/**
+data/processed/**
+data/debug/**
+data/templates/**
+!data/uploads/.gitkeep
+!data/processed/.gitkeep
+!data/debug/.gitkeep
+!data/templates/.gitkeep
+!data/correction-rules.json
+!data/records.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Logs / OS files
+*.log
+.DS_Store
