@@ -276,7 +276,12 @@ def find_tax_id(lines: list[dict[str, Any]], image_height: int = 700) -> dict[st
         for line in lines
         if re.fullmatch(r"[A-Za-z]{2}\s*\d{8}", str(line.get("text", "")))
     }
-    buyer_labels = [line for line in lines if buyer_label_re.search(str(line.get("text", "")))]
+    buyer_labels = [
+        line for line in lines
+        if buyer_label_re.search(str(line.get("text", "")))
+        and float((line.get("box") or {}).get("x1", 0)) < 0.68 * 1200
+        and float((line.get("box") or {}).get("y1", 0)) < image_height * 0.40
+    ]
     all_numbers = [(line, value) for line in lines for value in _eight_digit_candidates(str(line.get("text", ""))) if value not in invoice_suffixes]
     candidates: list[dict[str, Any]] = []
     for label in buyer_labels:
