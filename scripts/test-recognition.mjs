@@ -8,6 +8,7 @@ import { validateInvoiceRecognition } from "../lib/server/validateInvoiceRecogni
 import { REVIEW_STATUS } from "../lib/server/invoiceStatus.js";
 import { tableLineItemsFromWords } from "../lib/server/anchorExtractor.js";
 import { resolveBuyerTaxIdentity, resolveInvoiceIdentity } from "../lib/server/identityResolver.js";
+import { deriveTargetedInvoiceRoi, hasCredibleInvoiceCandidate } from "../lib/server/targetedInvoiceRecovery.js";
 import { probeModel } from "../lib/server/providerHealth.js";
 
 function test(name, fn) {
@@ -303,6 +304,23 @@ test("identity resolver preserves split invoice evidence and buyer/seller tax se
     imageHeight: 400
   });
   assert.equal(unanchored.value, "");
+});
+
+test("targeted invoice recovery uses normalized stacked-document ROI only when full-page identity is missing", () => {
+  assert.equal(hasCredibleInvoiceCandidate("AB12345678"), true);
+  assert.equal(hasCredibleInvoiceCandidate("AB1234"), false);
+  const roi = deriveTargetedInvoiceRoi({
+    width: 960,
+    height: 1706,
+    detection: { method: "synthetic-document-bounds", boundingBox: { left: 0, top: 223, width: 960, height: 1317 } },
+    template: { fields: { invoiceNumber: { x: 0.105, y: 0.08, w: 0.25, h: 0.12 } } }
+  });
+  assert.equal(roi.documentSlotCount, 2);
+  assert.equal(roi.documentSlotIndex, 0);
+  assert.equal(roi.coordinateSpace, "original-image");
+  assert.ok(roi.top > 223);
+  assert.ok(roi.top + roi.height < 223 + 1317 / 2 + 20);
+  assert.match(roi.selectionReason, /stacked invoice copies/);
 });
 
 test("table extraction scales from detected headers", () => {

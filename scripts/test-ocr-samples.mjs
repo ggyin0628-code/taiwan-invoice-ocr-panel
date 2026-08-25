@@ -209,7 +209,7 @@ function rootCauseCounts(results) {
 }
 
 function stagePerformanceSummary(results) {
-  const stages = ["intakeMs", "preprocessMs", "localOcrMs", "regionOcrMs", "identityResolverMs", "paddleOcrMs", "mergeMs", "totalMs"];
+  const stages = ["intakeMs", "preprocessMs", "localOcrMs", "regionOcrMs", "identityResolverMs", "paddleOcrMs", "targetedRoiPreprocessMs", "targetedRoiOcrMs", "targetedRoiTotalMs", "targetedRoiMs", "mergeMs", "totalMs"];
   return Object.fromEntries(stages.map((stage) => {
     const values = results.map((result) => Number(result.performance?.[stage])).filter((value) => Number.isFinite(value));
     return [stage, values.length ? {
@@ -332,6 +332,13 @@ async function run() {
     zeroEditConfirmable,
     averageProcessingMs: total ? results.reduce((sum, result) => sum + result.processingMs, 0) / total : null,
     stagePerformance: stagePerformanceSummary(results),
+    paddleInvocation: {
+      fullPageTotal: results.reduce((sum, result) => sum + Number(result.performance?.fullPagePaddleOcrInvocationCount || 0), 0),
+      fullPageAveragePerSample: total ? results.reduce((sum, result) => sum + Number(result.performance?.fullPagePaddleOcrInvocationCount || 0), 0) / total : 0,
+      targetedTotal: results.reduce((sum, result) => sum + Number(result.performance?.targetedRoiInvocationCount || 0), 0),
+      targetedAveragePerSample: total ? results.reduce((sum, result) => sum + Number(result.performance?.targetedRoiInvocationCount || 0), 0) / total : 0,
+      samplesWithTargetedRecovery: results.filter((result) => Number(result.performance?.targetedRoiInvocationCount || 0) > 0).length
+    },
     rootCauses: rootCauseCounts(results)
   };
   const failureMatrix = results.map((result) => ({
