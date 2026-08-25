@@ -1,6 +1,8 @@
-import { deleteRecord, readRecords, updateRecord } from "../../../../lib/server/records.js";
 import { publicFileUrl } from "../../../../lib/server/paths.js";
+import { deleteRecord, readRecords, updateRecord } from "../../../../lib/server/records.js";
 import { calculateTaxAndTotal, validateInvoiceRecord } from "../../../../lib/server/validation.js";
+import { REVIEW_STATUS } from "../../../../lib/server/invoiceStatus.js";
+import { formulaTotals, legacyFieldsFromLineItems, normalizeLineItem, normalizeLineItems } from "../../../../lib/server/lineItems.js";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -50,6 +52,32 @@ function buildItems(quantityValue, unitPriceValue, existingItems = []) {
   });
 }
 
+function validationInput(current, patch) {
+  return {
+    ...current,
+    ...patch,
+    items: patch.items ?? current.items,
+    confidence: Object.fromEntries(["invoiceNumber", "taxId", "quantity", "unitPrice", "salesAmount"].map((field) => [field, 1]))
+  };
+}
+
+function applyValidationPatch(patch, validation, reviewStatus) {
+  patch.validationErrors = validation.validationErrors;
+  patch.debug = {
+    ...(patch.debug || {}),
+    validatedJson: validation.validatedJson,
+    validationErrors: validation.validationErrors
+  };
+  patch.processingStatus = validation.validationErrors.length ? "need_review" : "done";
+  patch.reviewStatus = reviewStatus;
+  patch.warnings = validation.validationErrors.map((error) => error.reason);
+  patch.confidenceLevel = validation.validationErrors.length ? "low" : "high";
+  if (!validation.validationErrors.length) {
+    Object.assign(patch, validation.official);
+    patch.amountSource = "formula";
+  }
+}
+
 export async function PATCH(request, context) {
   const { id } = await context.params;
   const body = await request.json();
@@ -60,8 +88,19 @@ export async function PATCH(request, context) {
   for (const field of ["invoiceNumber", "taxId", "quantity", "unitPrice", "salesAmount", "taxAmount", "totalAmount"]) {
     if (Object.prototype.hasOwnProperty.call(body, field)) patch[field] = String(body[field] || "");
   }
-  const manuallyEditedFields = Object.keys(patch);
-  if (Object.prototype.hasOwnProperty.call(body, "quantity") || Object.prototype.hasOwnProperty.call(body, "unitPrice")) {
+  let lineItemsEdited = false;
+  if (Array.isArray(body.items)) {
+    const items = body.items.map((item, index) => normalizeLineItem(item, index));
+    patch.items = items;
+    Object.assign(patch, legacyFieldsFromLineItems(items));
+    const totals = formulaTotals(items);
+    patch.salesAmount = totals.salesAmount;
+    patch.taxAmount = totals.taxAmount;
+    patch.totalAmount = totals.totalAmount;
+    patch.amountSource = totals.amountSource;
+    lineItemsEdited = true;
+  }
+  if (!lineItemsEdited && (Object.prototype.hasOwnProperty.call(body, "quantity") || Object.prototype.hasOwnProperty.call(body, "unitPrice"))) {
     const nextQuantity = patch.quantity ?? current.quantity ?? "";
     const nextUnitPrice = patch.unitPrice ?? current.unitPrice ?? "";
     patch.items = buildItems(nextQuantity, nextUnitPrice, current.items || []);
@@ -84,32 +123,46 @@ export async function PATCH(request, context) {
   ) {
     patch.amountSource = "manual";
   }
+  const editableFields = new Set(["invoiceNumber", "taxId", "quantity", "unitPrice", "salesAmount", "taxAmount", "totalAmount"]);
+  const manuallyEditedFields = [...new Set([
+    ...Object.keys(body).filter((field) => editableFields.has(field)),
+    ...(lineItemsEdited ? ["items", "quantity", "unitPrice"] : [])
+  ])];
   if (body.status === "confirmed" || body.status === "unconfirmed") {
     patch.status = body.status;
     patch.confirmed = body.status === "confirmed";
   }
 
   if (body.status === "confirmed") {
+    const validation = validateInvoiceRecord(validationInput(current, patch));
+    if (validation.validationErrors.length) {
+      return Response.json({
+        error: "資料仍有必須修正的欄位，無法確認",
+        validationErrors: validation.validationErrors,
+        record: present(current)
+      }, { status: 422 });
+    }
+    Object.assign(patch, validation.official);
+    patch.items = (current.items || patch.items || []).map((item, index) => ({
+      ...item,
+      lineNo: item.lineNo || index + 1,
+      amount: Number(item.quantity) * Number(item.unitPrice),
+      status: "auto",
+      source: item.source || "manual"
+    }));
     patch.processingStatus = "done";
+    patch.reviewStatus = REVIEW_STATUS.AUTO_OK;
     patch.validationErrors = [];
     patch.warnings = [];
-    patch.confidenceLevel = "medium";
+    patch.confidenceLevel = "high";
+    patch.amountSource = "formula";
   } else if (Object.keys(patch).some((field) => field !== "status")) {
-    const validation = validateInvoiceRecord({
-      ...current.debug?.ocrRawJson,
-      ...current,
-      ...patch,
-      confidence: Object.fromEntries(["invoiceNumber", "taxId", "quantity", "unitPrice", "salesAmount"].map((field) => [field, 1]))
-    });
-    patch.validationErrors = validation.validationErrors;
-    patch.debug = {
-      ...(current.debug || {}),
-      validatedJson: validation.validatedJson,
-      validationErrors: validation.validationErrors
-    };
-    patch.processingStatus = validation.validationErrors.length ? "need_review" : "done";
-    patch.warnings = validation.validationErrors.map((error) => error.reason);
-    patch.confidenceLevel = validation.validationErrors.length ? "low" : "medium";
+    const validation = validateInvoiceRecord(validationInput(current, patch));
+    applyValidationPatch(
+      patch,
+      validation,
+      validation.validationErrors.length ? REVIEW_STATUS.REVIEW_REQUIRED : REVIEW_STATUS.AUTO_OK
+    );
   }
 
   if (manuallyEditedFields.length) {
@@ -121,7 +174,7 @@ export async function PATCH(request, context) {
       ...(current.fieldStatuses || {}),
       ...Object.fromEntries(manuallyEditedFields.map((field) => [field, "auto"]))
     };
-    if (manuallyEditedFields.includes("quantity") || manuallyEditedFields.includes("unitPrice")) {
+    if (lineItemsEdited || manuallyEditedFields.includes("quantity") || manuallyEditedFields.includes("unitPrice")) {
       patch.fieldSources.salesAmount = "formula";
       patch.fieldSources.taxAmount = "formula";
       patch.fieldSources.totalAmount = "formula";

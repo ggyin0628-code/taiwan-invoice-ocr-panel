@@ -26,6 +26,11 @@ data/templates/**
 !data/correction-rules.json
 !data/records.json
 
+# OCR evaluation data — real invoices and ground truth stay local
+samples-private/
+ground-truth-private.json
+.ocr-benchmark/
+
 # Python cache
 __pycache__/
 *.py[cod]

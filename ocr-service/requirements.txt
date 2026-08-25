@@ -1,7 +1,6 @@
-fastapi
-uvicorn
-python-multipart
-pillow
-opencv-python
-paddleocr
-paddlepaddle
+uvicorn==0.52.1
+python-multipart==0.0.20
+pillow==12.3.0
+opencv-contrib-python==4.10.0.84
+paddleocr==3.7.0
+paddlepaddle==3.3.1

@@ -86,6 +86,63 @@ h2 {
   white-space: nowrap;
 }
 
+.healthStrip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  max-width: 1680px;
+  margin: 0 auto 18px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfa;
+}
+
+.healthItems {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.healthItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+}
+
+.healthItem strong {
+  color: var(--ink);
+}
+
+.healthItem em {
+  border-radius: 999px;
+  padding: 3px 7px;
+  font-style: normal;
+  font-weight: 800;
+  letter-spacing: .02em;
+}
+
+.healthItem.ready em {
+  color: #166534;
+  background: #dcfce7;
+}
+
+.healthItem.down em,
+.healthItem.missing em {
+  color: #92400e;
+  background: #fef3c7;
+}
+
+.healthStrip p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: right;
+}
+
 .metrics {
   max-width: 1680px;
   margin: 0 auto 18px;
@@ -1253,6 +1310,65 @@ h2 {
   font-size: 12px;
 }
 
+.lineItemsScroll {
+  overflow-x: auto;
+}
+
+.editableLineItemsTable {
+  min-width: 920px;
+}
+
+.editableLineItemsTable input {
+  width: 100%;
+  min-width: 74px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 6px 7px;
+  background: #fff;
+  color: var(--ink);
+}
+
+.editableLineItemsTable td:first-child,
+.editableLineItemsTable td:nth-child(5),
+.editableLineItemsTable td:nth-child(6) {
+  white-space: nowrap;
+}
+
+.itemNeedsReview td {
+  background: #fff8e7;
+}
+
+.lineItemActions {
+  display: flex;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.compactButton,
+.linkButton {
+  white-space: nowrap;
+}
+
+.linkButton {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.linkButton:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.dangerText {
+  color: #b42318;
+}
+
 .emptyInline {
   margin: 0;
   padding: 10px 12px;
@@ -1362,9 +1478,14 @@ h2 {
   }
 
   .topbar,
-  .tableToolbar {
+  .tableToolbar,
+  .healthStrip {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .healthStrip p {
+    text-align: left;
   }
 
   .metrics {

@@ -13,7 +13,7 @@
     "test:ocr": "node scripts/test-ocr-samples.mjs",
     "paddleocr:service": "cd ocr-service && uvicorn app:app --host 127.0.0.1 --port 8765",
     "package:local": "node scripts/package-local.mjs",
-    "kill:3000": "lsof -ti tcp:3000 | xargs kill || true"
+    "kill:3000": "fuser -k 3000/tcp || true"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

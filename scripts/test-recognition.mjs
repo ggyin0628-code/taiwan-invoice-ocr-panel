@@ -5,6 +5,9 @@ import { recognizeInvoiceWithPaddleOcr } from "../lib/server/paddleOcrProvider.j
 import { mergeInvoiceRecognitionResults, validateProviderCandidate } from "../lib/server/mergeInvoiceRecognitionResults.js";
 import { processInvoiceRecord } from "../lib/server/processInvoice.js";
 import { validateInvoiceRecognition } from "../lib/server/validateInvoiceRecognition.js";
+import { REVIEW_STATUS } from "../lib/server/invoiceStatus.js";
+import { tableLineItemsFromWords } from "../lib/server/anchorExtractor.js";
+import { probeModel } from "../lib/server/providerHealth.js";
 
 function test(name, fn) {
   try {
@@ -153,4 +156,127 @@ test("manual provider returns empty manual-required record without OCR", async (
   assert.equal(result.providerStatus, "manual_required");
   assert.equal(result.processingStatus, "need_review");
   assert.equal(result.fieldSources.invoiceNumber, "manual");
+});
+
+test("informational Paddle warning does not create validation failure", () => {
+  const result = validateInvoiceRecognition({
+    invoiceNo: "VT17832862",
+    buyerTaxId: "49403043",
+    items: [{ quantity: 1, unitPrice: 150000 }],
+    warnings: ["PaddleOCR 僅供初步填入，仍需人工確認"],
+    confidence: 0.9
+  }, { source: "paddleocr", defaultConfidence: 0.9 });
+  assert.equal(result.reviewStatus, REVIEW_STATUS.AUTO_OK);
+  assert.equal(result.overallStatus, "auto");
+});
+
+test("valid low-confidence fields are retained as review recommended", () => {
+  const result = validateInvoiceRecognition({
+    invoiceNo: "VT17832862",
+    buyerTaxId: "49403043",
+    items: [{ quantity: 1, unitPrice: 150000 }],
+    confidence: { invoiceNo: 0.9, buyerTaxId: 0.65, quantity: 0.9, unitPrice: 0.9 }
+  }, { source: "paddleocr", defaultConfidence: 0.9 });
+  assert.equal(result.buyerTaxId.value, "49403043");
+  assert.equal(result.buyerTaxId.status, "low_confidence");
+  assert.equal(result.reviewStatus, REVIEW_STATUS.REVIEW_RECOMMENDED);
+  assert.equal(result.items[0].amount.value, 150000);
+});
+
+test("identity merge prefers materially stronger candidate", () => {
+  const paddle = validateProviderCandidate({
+    invoiceNo: "TT00000001",
+    buyerTaxId: "00000001",
+    items: [{ quantity: 1, unitPrice: 2530 }],
+    confidence: 0.96
+  }, { source: "paddleocr", defaultConfidence: 0.96 });
+  const local = validateProviderCandidate({
+    invoiceNo: "TT99999999",
+    buyerTaxId: "99999999",
+    items: [{ quantity: 1, unitPrice: 2530 }],
+    confidence: 0.6
+  }, { source: "tesseract", defaultConfidence: 0.6 });
+  const merged = mergeInvoiceRecognitionResults({ candidates: [paddle, local], mode: "hybrid" });
+  assert.equal(merged.recognitionResult.invoiceNo.value, "TT00000001");
+  assert.equal(merged.recognitionResult.invoiceNo.status, "auto");
+  assert.equal(merged.recognitionResult.buyerTaxId.value, "00000001");
+});
+
+test("identity merge keeps close-confidence conflict reviewable", () => {
+  const first = validateProviderCandidate({
+    invoiceNo: "TT00000001",
+    buyerTaxId: "00000001",
+    items: [{ quantity: 1, unitPrice: 2530 }],
+    confidence: 0.9
+  }, { source: "paddleocr", defaultConfidence: 0.9 });
+  const second = validateProviderCandidate({
+    invoiceNo: "TT99999999",
+    buyerTaxId: "99999999",
+    items: [{ quantity: 1, unitPrice: 2530 }],
+    confidence: 0.82
+  }, { source: "tesseract", defaultConfidence: 0.82 });
+  const merged = mergeInvoiceRecognitionResults({ candidates: [first, second], mode: "hybrid" });
+  assert.equal(merged.recognitionResult.invoiceNo.value, null);
+  assert.equal(merged.recognitionResult.invoiceNo.status, "low_confidence");
+});
+
+test("invalid and missing fields remain required review errors", () => {
+  const result = validateInvoiceRecognition({
+    invoiceNo: "17832862",
+    buyerTaxId: "ABC",
+    items: [{ quantity: 0, unitPrice: "一萬" }],
+    confidence: 0.9
+  }, { source: "paddleocr", defaultConfidence: 0.9 });
+  assert.equal(result.reviewStatus, REVIEW_STATUS.INVALID);
+  assert.ok(result.items[0].quantity.severity === "invalid");
+});
+
+test("confirmation path validates before clearing errors", () => {
+  const source = readFileSync(resolve("app/api/records/[id]/route.js"), "utf8");
+  assert.ok(source.indexOf('if (body.status === "confirmed")') < source.indexOf('const validation = validateInvoiceRecord(validationInput(current, patch));'));
+  assert.ok(source.includes('status: 422'));
+});
+
+test("OCR benchmark fails explicitly without private samples", () => {
+  const source = readFileSync(resolve("scripts/test-ocr-samples.mjs"), "utf8");
+  assert.ok(source.includes("samples-private"));
+  assert.ok(source.includes("process.exitCode = 2"));
+  assert.ok(source.includes("fieldAccuracy"));
+  assert.ok(source.includes("providerFailureRate"));
+});
+
+test("frontend line item editor supports row editing operations", () => {
+  const source = readFileSync(resolve("app/page.jsx"), "utf8");
+  assert.ok(source.includes("function updateRecordItems"));
+  assert.ok(source.includes("新增列"));
+  assert.ok(source.includes("刪除"));
+  assert.ok(source.includes("確認列"));
+  assert.ok(source.includes("editableLineItemsTable"));
+});
+
+test("health and doctor expose degradation states", () => {
+  const healthRoute = readFileSync(resolve("app/api/health/route.js"), "utf8");
+  const doctor = readFileSync(resolve("scripts/doctor.mjs"), "utf8");
+  assert.ok(healthRoute.includes("collectProviderHealth"));
+  assert.ok(healthRoute.includes("degradation"));
+  assert.ok(doctor.includes('readiness("PaddleOCR"'));
+  assert.ok(doctor.includes('readiness("Model"'));
+  assert.ok(doctor.includes('"MISSING"'));
+  assert.equal(probeModel({ status: "READY", models: [{ name: "qwen2.5vl:7b" }] }).status, "READY");
+  assert.equal(probeModel({ status: "READY", models: [] }).status, "MISSING");
+});
+
+test("table extraction scales from detected headers", () => {
+  const result = tableLineItemsFromWords([
+    { text: "數量", left: 580, top: 90, width: 70, height: 30, confidence: 95 },
+    { text: "單價", left: 880, top: 90, width: 70, height: 30, confidence: 95 },
+    { text: "金額", left: 1280, top: 90, width: 70, height: 30, confidence: 95 },
+    { text: "2", left: 600, top: 180, width: 30, height: 30, confidence: 95 },
+    { text: "100", left: 900, top: 180, width: 60, height: 30, confidence: 95 },
+    { text: "200", left: 1300, top: 180, width: 60, height: 30, confidence: 95 }
+  ], { imageWidth: 2000, imageHeight: 1000 });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].quantity, 2);
+  assert.equal(result.items[0].unitPrice, 100);
+  assert.equal(result.items[0].amount, 200);
 });

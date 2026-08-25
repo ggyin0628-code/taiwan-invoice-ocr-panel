@@ -6,14 +6,19 @@ from pathlib import Path
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 
-from paddle_invoice_ocr import recognize_invoice
+from paddle_invoice_ocr import get_engine_health, recognize_invoice
 
 app = FastAPI(title="Finance Receipt PaddleOCR Service")
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "provider": "paddleocr"}
+    readiness = get_engine_health()
+    ready = bool(readiness.get("engineReady") and readiness.get("modelReady"))
+    return JSONResponse(
+        {"ok": ready, "provider": "paddleocr", **readiness},
+        status_code=200 if ready else 503,
+    )
 
 
 @app.post("/ocr/invoice")

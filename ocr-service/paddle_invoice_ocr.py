@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
 from PIL import Image
@@ -14,19 +13,71 @@ STATUS_INVALID = "INVALID"
 STATUS_MISSING = "MISSING"
 
 
+_ENGINE_STATE: dict[str, Any] = {
+    "paddleocrVersion": None,
+    "paddleVersion": None,
+    "modelReady": False,
+    "engineReady": False,
+    "lastInitializationError": None,
+    "apiMode": None,
+}
+
+
 @lru_cache(maxsize=1)
 def get_ocr():
-    from paddleocr import PaddleOCR
-
     try:
-        return PaddleOCR(
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            engine="paddle",
-        )
-    except TypeError:
-        return PaddleOCR(use_angle_cls=False, lang="ch", show_log=False)
+        import paddle
+        from paddleocr import PaddleOCR, __version__ as paddleocr_version
+
+        _ENGINE_STATE["paddleVersion"] = getattr(paddle, "__version__", None)
+        _ENGINE_STATE["paddleocrVersion"] = paddleocr_version
+        modern_config = {
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": False,
+            "engine": "paddle",
+            # PaddlePaddle 3.3.x CPU oneDNN PIR conversion can fail on this path.
+            "enable_mkldnn": False,
+        }
+        try:
+            engine = PaddleOCR(**modern_config)
+            _ENGINE_STATE["apiMode"] = "predict"
+        except TypeError:
+            try:
+                engine = PaddleOCR(use_angle_cls=False, lang="ch", show_log=False, enable_mkldnn=False)
+            except TypeError:
+                engine = PaddleOCR(use_angle_cls=False, lang="ch", show_log=False)
+            _ENGINE_STATE["apiMode"] = "legacy"
+        if not (hasattr(engine, "predict") or hasattr(engine, "ocr")):
+            raise RuntimeError("PaddleOCR engine exposes neither predict() nor ocr()")
+        _ENGINE_STATE["modelReady"] = True
+        _ENGINE_STATE["engineReady"] = True
+        _ENGINE_STATE["lastInitializationError"] = None
+        return engine
+    except Exception as exc:
+        _ENGINE_STATE["modelReady"] = False
+        _ENGINE_STATE["engineReady"] = False
+        _ENGINE_STATE["lastInitializationError"] = f"{type(exc).__name__}: {exc}"
+        raise
+
+
+def get_engine_health() -> dict[str, Any]:
+    try:
+        engine = get_ocr()
+        ready = engine is not None and (hasattr(engine, "predict") or hasattr(engine, "ocr"))
+        _ENGINE_STATE["engineReady"] = bool(ready)
+        _ENGINE_STATE["modelReady"] = bool(ready)
+    except Exception:
+        pass
+    return {
+        "service": "paddleocr",
+        "paddleocrVersion": _ENGINE_STATE["paddleocrVersion"],
+        "paddleVersion": _ENGINE_STATE["paddleVersion"],
+        "modelReady": bool(_ENGINE_STATE["modelReady"]),
+        "engineReady": bool(_ENGINE_STATE["engineReady"]),
+        "lastInitializationError": _ENGINE_STATE["lastInitializationError"],
+        "apiMode": _ENGINE_STATE["apiMode"],
+    }
 
 
 def _box_from_points(points: list[Any]) -> dict[str, int]:
@@ -127,7 +178,7 @@ def field(value: Any, confidence: float, status: str = STATUS_NEEDS_REVIEW) -> d
     return {"value": value, "confidence": confidence, "source": "paddleocr", "status": status}
 
 
-def find_invoice_no(lines: list[dict[str, Any]]) -> dict[str, Any]:
+def find_invoice_no(lines: list[dict[str, Any]], image_height: int = 700) -> dict[str, Any]:
     joined = " ".join(line["text"].upper() for line in lines)
     match = re.search(r"[A-Z]{2}\s*\d{8}", joined)
     if match:
@@ -147,47 +198,73 @@ def find_invoice_no(lines: list[dict[str, Any]]) -> dict[str, Any]:
     for prefix_line, prefix_x, prefix_y in prefix_candidates:
         prefix = prefix_line["text"].upper()
         for number_line, number_x, number_y, number in number_candidates:
-            if number_x > prefix_x and abs(number_y - prefix_y) <= 35 and prefix_y < 180:
+            if number_x > prefix_x and abs(number_y - prefix_y) <= max(24, image_height * 0.05) and prefix_y < image_height * 0.26:
                 confidence = min(float(prefix_line["confidence"]), float(number_line["confidence"]))
                 return field(f"{prefix}{number}", confidence, STATUS_CONFIRMED if confidence >= 0.85 else STATUS_NEEDS_REVIEW)
     return field(None, 0, STATUS_MISSING)
 
 
-def find_tax_id(lines: list[dict[str, Any]]) -> dict[str, Any]:
-    keyword_re = re.compile(r"(統一編號|統編|買受人|營業人)")
-    candidates: list[tuple[int, float, str]] = []
-    label_lines = [line for line in lines if re.search(r"(統一編號|統編)", line["text"])]
+def _identity_status(confidence: float) -> str:
+    return STATUS_CONFIRMED if confidence >= 0.85 else STATUS_NEEDS_REVIEW
+
+
+def _eight_digit_candidates(text: str) -> list[str]:
+    normalized = digits(text)
+    return [match.group(0) for match in re.finditer(r"\d{8}", normalized)]
+
+
+def find_tax_id(lines: list[dict[str, Any]], image_height: int = 700) -> dict[str, Any]:
+    # OCR may emit either traditional or simplified characters for the buyer label.
+    keyword_re = re.compile(r"([統统]一編號|[統统]編|[買买]受人|營業人)")
+    label_re = re.compile(r"([統统]一編號|[統统]編)")
+    invoice_suffixes = {
+        digits(line.get("text", ""))
+        for line in lines
+        if re.fullmatch(r"[A-Za-z]{2}\s*\d{8}", str(line.get("text", "")))
+    }
+    label_lines = [line for line in lines if label_re.search(str(line.get("text", "")))]
     for label in label_lines:
         label_x, label_y = line_center(label)
+        # A combined OCR line often contains the label, buyer ID, and date together.
+        inline = [candidate for candidate in _eight_digit_candidates(str(label.get("text", ""))) if candidate not in invoice_suffixes]
+        if inline:
+            confidence = float(label.get("confidence", 0))
+            return field(inline[0], confidence, _identity_status(confidence))
+
         same_row_numbers: list[tuple[float, float, str]] = []
         for line in lines:
-            text_digits = digits(line["text"])
-            if not re.fullmatch(r"\d{8}", text_digits):
-                continue
             cx, cy = line_center(line)
-            if cx <= label_x or abs(cy - label_y) > 35:
+            if cx <= label_x or abs(cy - label_y) > max(24, image_height * 0.05):
                 continue
-            same_row_numbers.append((cx - label_x, float(line["confidence"]), text_digits))
+            for value in _eight_digit_candidates(str(line.get("text", ""))):
+                if value not in invoice_suffixes:
+                    same_row_numbers.append((cx - label_x, float(line.get("confidence", 0)), value))
         if same_row_numbers:
             _, confidence, value = sorted(same_row_numbers, key=lambda item: item[0])[0]
-            return field(value, min(confidence, 0.84), STATUS_NEEDS_REVIEW)
+            return field(value, confidence, _identity_status(confidence))
 
+    candidates: list[tuple[int, float, str]] = []
     for index, line in enumerate(lines):
-        text = line["text"]
+        text = str(line.get("text", ""))
         if not keyword_re.search(text):
             continue
-        window = " ".join(next_line["text"] for next_line in lines[index : index + 4])
-        for match in re.finditer(r"\d{8}", digits(window)):
-            candidates.append((index, line["confidence"], match.group(0)))
+        window = " ".join(next_line.get("text", "") for next_line in lines[index : index + 4])
+        for value in _eight_digit_candidates(window):
+            if value not in invoice_suffixes:
+                candidates.append((index, float(line.get("confidence", 0)), value))
     if not candidates:
         for line in lines:
-            for match in re.finditer(r"\d{8}", digits(line["text"])):
-                candidates.append((999, line["confidence"], match.group(0)))
+            top = float((line.get("box") or {}).get("y1", 0) or 0)
+            left = float((line.get("box") or {}).get("x1", 0) or 0)
+            if top >= image_height * 0.40 or left >= 900:
+                continue
+            for value in _eight_digit_candidates(str(line.get("text", ""))):
+                if value not in invoice_suffixes:
+                    candidates.append((999, float(line.get("confidence", 0)), value))
     if not candidates:
         return field(None, 0, STATUS_MISSING)
-    _, confidence, value = sorted(candidates, key=lambda item: item[0])[0]
-    # Handwritten boxed tax IDs are easy to misread even when OCR reports high confidence.
-    return field(value, min(confidence, 0.84), STATUS_NEEDS_REVIEW)
+    _, confidence, value = sorted(candidates, key=lambda item: (-item[1], item[0]))[0]
+    return field(value, confidence, _identity_status(confidence))
 
 
 def line_center(line: dict[str, Any]) -> tuple[float, float]:
@@ -221,9 +298,9 @@ def _band(center: float, half_width: float) -> tuple[float, float]:
     return (center - half_width, center + half_width)
 
 
-def estimate_table_bands(lines: list[dict[str, Any]], header_y: float) -> dict[str, tuple[float, float]]:
+def estimate_table_bands(lines: list[dict[str, Any]], header_y: float, image_width: int = 1200) -> dict[str, tuple[float, float]]:
     """Estimate column bands from the recognized table header on the corrected invoice."""
-    header_lines = [line for line in lines if abs(line["box"]["y1"] - header_y) <= 24]
+    header_lines = [line for line in lines if abs(line["box"]["y1"] - header_y) <= max(18, image_width * 0.02)]
     bands: dict[str, tuple[float, float]] = {}
 
     for line in header_lines:
@@ -244,10 +321,10 @@ def estimate_table_bands(lines: list[dict[str, Any]], header_y: float) -> dict[s
         if "金額" in text or "金额" in text or text in {"金", "額", "额"}:
             bands["amountReference"] = _band(cx, 75)
 
-    # Conservative fallback for the normalized 1200px-wide corrected invoice.
-    bands.setdefault("quantity", (390, 505))
-    bands.setdefault("unitPrice", (505, 625))
-    bands.setdefault("amountReference", (625, 780))
+    # Relative fallback for invoices where the table headers were not recognized.
+    bands.setdefault("quantity", (image_width * 0.325, image_width * 0.425))
+    bands.setdefault("unitPrice", (image_width * 0.425, image_width * 0.535))
+    bands.setdefault("amountReference", (image_width * 0.535, image_width * 0.68))
     return bands
 
 
@@ -255,7 +332,7 @@ def in_band(cx: float, band: tuple[float, float]) -> bool:
     return band[0] <= cx <= band[1]
 
 
-def extract_items(lines: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+def extract_items(lines: list[dict[str, Any]], image_width: int = 1200, image_height: int = 700) -> tuple[list[dict[str, Any]], list[str]]:
     header_y = None
     lower_y = None
     for line in lines:
@@ -270,10 +347,10 @@ def extract_items(lines: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], li
     if lower_y is None:
         lower_y = 999999
 
-    bands = estimate_table_bands(lines, header_y)
+    bands = estimate_table_bands(lines, header_y, image_width)
     table_lines = [
         line for line in lines
-        if header_y + 10 <= line["box"]["y1"] <= lower_y - 5 and line["box"]["x1"] < 760
+        if header_y + max(8, image_height * 0.012) <= line["box"]["y1"] <= lower_y - max(4, image_height * 0.008) and line["box"]["x1"] < image_width * 0.86
     ]
     rows = group_rows(table_lines)
     items: list[dict[str, Any]] = []
@@ -288,7 +365,7 @@ def extract_items(lines: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], li
             text = line["text"]
             cx, _ = line_center(line)
             value = normalized_text_number(text)
-            if cx < 350 and not re.fullmatch(r"[\d,\sIl|L]+", text):
+            if cx < image_width * 0.30 and not re.fullmatch(r"[\d,\sIl|L]+", text):
                 name_parts.append(text)
             elif in_band(cx, bands["quantity"]) and value is not None and 1 <= value <= 999:
                 quantity = value
@@ -317,14 +394,14 @@ def extract_items(lines: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], li
                 "status": STATUS_CONFIRMED if confidence >= 0.85 else STATUS_NEEDS_REVIEW,
             }
         )
-    return items[:8], warnings
+    return items[:30], warnings
 
 
 def recognize_invoice(image_path: str) -> dict[str, Any]:
     image = Image.open(image_path)
     lines = run_paddleocr(image_path)
     raw_text = "\n".join(line["text"] for line in lines)
-    items, item_warnings = extract_items(lines)
+    items, item_warnings = extract_items(lines, image.width, image.height)
     subtotal = sum(item["amount"] for item in items if isinstance(item.get("amount"), int)) if items else None
     tax = round(subtotal * 0.05) if subtotal else None
     total = subtotal + tax if subtotal and tax is not None else None
@@ -334,13 +411,14 @@ def recognize_invoice(image_path: str) -> dict[str, Any]:
         "rawText": raw_text,
         "lines": lines,
         "fields": {
-            "invoiceNo": find_invoice_no(lines),
-            "buyerTaxId": find_tax_id(lines),
+            "invoiceNo": find_invoice_no(lines, image.height),
+            "buyerTaxId": find_tax_id(lines, image.height),
             "items": items,
             "subtotal": subtotal,
             "tax": tax,
             "total": total,
         },
-        "warnings": ["PaddleOCR 僅供初步填入，仍需人工確認", *item_warnings],
+        "warnings": item_warnings,
+        "notices": ["PaddleOCR 僅供初步填入，仍需人工確認"],
         "debug": {"imageWidth": image.width, "imageHeight": image.height},
     }

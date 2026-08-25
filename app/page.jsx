@@ -109,6 +109,37 @@ function recordItems(record) {
   return buildLineItems(record?.quantity || "", record?.unitPrice || "");
 }
 
+function normalizeClientLineItem(item, index) {
+  const quantityText = String(item?.quantity ?? "").replace(/[^\d.]/g, "");
+  const unitPriceText = String(item?.unitPrice ?? "").replace(/[^\d]/g, "");
+  const quantity = quantityText ? Number(quantityText) : null;
+  const unitPrice = unitPriceText ? Number(unitPriceText) : null;
+  const complete = Number.isFinite(quantity) && quantity > 0 && Number.isFinite(unitPrice) && unitPrice > 0;
+  return {
+    lineNo: index + 1,
+    itemName: textInput(item?.itemName ?? item?.name ?? ""),
+    quantity: complete || quantity != null ? quantity : null,
+    unitPrice: complete || unitPrice != null ? unitPrice : null,
+    amount: complete ? quantity * unitPrice : null,
+    confidence: Number.isFinite(Number(item?.confidence)) ? Number(item.confidence) : complete ? 1 : 0,
+    source: item?.source || "manual",
+    status: item?.status === "confirmed" ? "confirmed" : complete ? item?.status || "auto" : "manual_required"
+  };
+}
+
+function normalizeClientLineItems(items) {
+  return (Array.isArray(items) ? items : []).map((item, index) => normalizeClientLineItem(item, index));
+}
+
+function lineItemTotals(items) {
+  const normalized = normalizeClientLineItems(items);
+  const complete = normalized.length > 0 && normalized.every((item) => item.quantity != null && item.unitPrice != null);
+  if (!complete) return { quantity: normalized.map((item) => item.quantity ?? "").join(","), unitPrice: normalized.map((item) => item.unitPrice ?? "").join(","), salesAmount: "", taxAmount: "", totalAmount: "", amountSource: "none" };
+  const salesAmount = normalized.reduce((sum, item) => sum + item.quantity * item.unitPrice, 0);
+  const taxAmount = Math.round(salesAmount * 0.05);
+  return { quantity: normalized.map((item) => item.quantity).join(","), unitPrice: normalized.map((item) => item.unitPrice).join(","), salesAmount: String(salesAmount), taxAmount: String(taxAmount), totalAmount: String(salesAmount + taxAmount), amountSource: "formula" };
+}
+
 function numericInput(value) {
   return String(value || "").replace(/[^\d]/g, "");
 }
@@ -168,6 +199,7 @@ export default function HomePage() {
   const [loading, setLoading] = useState(true);
   const [queueState, setQueueState] = useState({ active: false, total: 0, completed: 0, status: "等待批量匯入" });
   const [templates, setTemplates] = useState([]);
+  const [health, setHealth] = useState(null);
   const ocrProvider = "hybrid";
   const fileInputRef = useRef(null);
 
@@ -184,12 +216,25 @@ export default function HomePage() {
   useEffect(() => {
     loadRecords();
     loadTemplates();
+    loadHealth();
+    const timer = window.setInterval(loadHealth, 30000);
+    return () => window.clearInterval(timer);
   }, []);
 
   async function loadTemplates() {
     const response = await fetch("/api/templates", { cache: "no-store" });
     const result = await response.json();
     setTemplates(Array.isArray(result.templates) ? result.templates : []);
+  }
+
+  async function loadHealth() {
+    try {
+      const response = await fetch("/api/health", { cache: "no-store" });
+      const result = await response.json();
+      setHealth(result);
+    } catch (error) {
+      setHealth({ ok: false, error: error?.message || "健康狀態無法取得" });
+    }
   }
 
   const selected = records.find((record) => record.id === selectedId) || records[0] || null;
@@ -294,15 +339,40 @@ export default function HomePage() {
     }
   }
 
+  async function updateRecordItems(id, nextItems) {
+    const items = normalizeClientLineItems(nextItems);
+    const totals = lineItemTotals(items);
+    const patch = { items, ...totals, status: "unconfirmed" };
+    setRecords((current) => current.map((record) => record.id === id ? { ...record, ...patch } : record));
+    const response = await fetch(`/api/records/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch)
+    });
+    if (response.ok) {
+      const result = await response.json();
+      setRecords((current) => current.map((record) => record.id === id ? result.record : record));
+    }
+  }
+
   async function confirmRecord(id) {
     const response = await fetch(`/api/records/${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status: "confirmed" })
     });
+    const result = await response.json().catch(() => ({}));
     if (response.ok) {
-      const result = await response.json();
       setRecords((current) => current.map((record) => record.id === id ? result.record : record));
+    } else {
+      setRecords((current) => current.map((record) => record.id === id ? {
+        ...record,
+        status: "unconfirmed",
+        confirmed: false,
+        processingStatus: "need_review",
+        reviewStatus: "REVIEW_REQUIRED",
+        validationErrors: result.validationErrors || [{ field: "record", reason: result.error || "仍有欄位需要修正" }]
+      } : record));
     }
   }
 
@@ -359,8 +429,10 @@ export default function HomePage() {
           <p className="eyebrow">正式桌機版 · data/uploads + data/records.json</p>
           <h1>財務收據整理面板</h1>
         </div>
-          <div className="statusPill">正式 hybrid：PaddleOCR 主力 + Ollama 輔助 + 公式金額 + 人工確認</div>
+          <div className="statusPill">local-first：自動辨識 → 人工校正 → Excel</div>
       </header>
+
+      <HealthSummary health={health} />
 
       <section className="metrics" aria-label="財務摘要">
         <Metric label="今日新增筆數" value={`${metrics.today} 筆`} />
@@ -465,7 +537,7 @@ export default function HomePage() {
                 <ProviderSummary record={selected} selectedProvider={ocrProvider} />
                 <RecordWarnings record={selected} />
                 <div className="coreFieldGrid">
-                  {CORE_FIELDS.map(([field, label]) => (
+                  {CORE_FIELDS.filter(([field]) => !["quantity", "unitPrice"].includes(field)).map(([field, label]) => (
                     <label key={field} className={fieldStatus(selected, field) !== "auto" || fieldConfidence(selected, field) < 0.6 ? "fieldInvalid" : ""}>
                       <span className="fieldTitle">
                         {label}
@@ -503,7 +575,7 @@ export default function HomePage() {
                     <small>金額 + 稅金</small>
                   </label>
                 </div>
-                <LineItemsTable record={selected} />
+                <LineItemsTable record={selected} onChange={updateRecordItems} />
                 <div className="detailActions">
                   <button type="button" className="primary" onClick={() => confirmRecord(selected.id)} disabled={selected.status === "confirmed"}>
                     <CheckCircle2 size={16} /> 確認本筆資料
@@ -539,6 +611,24 @@ function StatusBadge({ status }) {
   return <em className={`statusBadge ${status || "pending"}`}>{PROCESS_LABELS[status] || status || "等待處理"}</em>;
 }
 
+function HealthSummary({ health }) {
+  const providers = health?.providers || {};
+  const entries = [
+    ["Next.js", health?.ok === false ? "DOWN" : "READY"],
+    ["PaddleOCR", providers.paddle?.status || "DOWN"],
+    ["Ollama", providers.ollama?.status || "DOWN"],
+    ["Model", providers.model?.status || "MISSING"]
+  ];
+  return (
+    <section className="healthStrip" aria-label="服務健康狀態">
+      <div className="healthItems">
+        {entries.map(([label, status]) => <span key={label} className={`healthItem ${String(status).toLowerCase()}`}><strong>{label}</strong><em>{status}</em></span>)}
+      </div>
+      <p>{health?.degradation?.message || health?.error || "正在檢查本機 OCR 服務狀態..."}</p>
+    </section>
+  );
+}
+
 function ProviderSummary({ record, selectedProvider }) {
   const requested = record.requestedProvider || record.recognitionMode || selectedProvider || "local";
   const actual = record.actualProvider || (record.processingStatus === "pending" ? "" : requested);
@@ -551,7 +641,8 @@ function ProviderSummary({ record, selectedProvider }) {
       <span>金額來源：{record.amountSource || "none"}</span>
       <span>信心等級：{record.confidenceLevel || "low"}</span>
       {status === "provider_unavailable" ? <strong>外部 Provider 不可用，已 fallback 本機 OCR，請人工確認。</strong> : null}
-      {record.confidenceLevel === "low" ? <strong>需人工確認</strong> : null}
+      {record.reviewStatus === "REVIEW_RECOMMENDED" ? <strong>建議人工複核</strong> : null}
+      {record.reviewStatus === "REVIEW_REQUIRED" || record.reviewStatus === "INVALID" ? <strong>必須人工修正後才能確認</strong> : null}
     </div>
   );
 }
@@ -574,39 +665,77 @@ function FieldMeta({ source, status }) {
   );
 }
 
-function LineItemsTable({ record }) {
-  const items = recordItems(record).filter((item) => item.quantity != null || item.unitPrice != null || item.amount != null);
+function LineItemsTable({ record, onChange }) {
+  const items = recordItems(record).filter((item) => item.itemName || item.quantity != null || item.unitPrice != null || item.amount != null);
+
+  function updateItem(index, patch) {
+    const next = items.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch, status: "manual", source: "manual", confidence: 1 } : item);
+    onChange?.(record.id, next);
+  }
+
+  function addItem() {
+    onChange?.(record.id, [...items, { lineNo: items.length + 1, itemName: "", quantity: null, unitPrice: null, amount: null, confidence: 0, source: "manual", status: "manual_required" }]);
+  }
+
+  function removeItem(index) {
+    onChange?.(record.id, items.filter((_, itemIndex) => itemIndex !== index));
+  }
+
+  function confirmItem(index) {
+    const next = items.map((item, itemIndex) => itemIndex === index ? { ...item, status: "confirmed", source: "manual", confidence: 1 } : item);
+    onChange?.(record.id, next);
+  }
+
   return (
     <div className="lineItemsPanel">
       <div className="panelHead compactHead">
-        <h3>明細列預覽</h3>
-        <span>{items.length} 筆</span>
+        <div>
+          <h3>可編輯明細列</h3>
+          <span>每列金額由數量 × 單價重算，確認前仍可修改。</span>
+        </div>
+        <button type="button" className="secondary compactButton" onClick={addItem}>新增列</button>
       </div>
       {items.length ? (
-        <table className="lineItemsTable">
-          <thead>
-            <tr>
-              <th>列</th>
-              <th>數量</th>
-              <th>單價</th>
-              <th>金額</th>
-              <th>狀態</th>
-            </tr>
-          </thead>
-          <tbody>
-            {items.map((item, index) => (
-              <tr key={`${record.id}-item-${index}`}>
-                <td>{item.lineNo || index + 1}</td>
-                <td>{item.quantity ?? ""}</td>
-                <td>{item.unitPrice ?? ""}</td>
-                <td>{item.amount ?? (item.quantity != null && item.unitPrice != null ? Number(item.quantity) * Number(item.unitPrice) : "")}</td>
-                <td>{FIELD_STATUS_LABELS[item.status] || item.status || "auto"}</td>
+        <div className="lineItemsScroll">
+          <table className="lineItemsTable editableLineItemsTable">
+            <thead>
+              <tr>
+                <th>列號</th>
+                <th>品名</th>
+                <th>數量</th>
+                <th>單價</th>
+                <th>公式金額</th>
+                <th>OCR 信心</th>
+                <th>來源</th>
+                <th>狀態</th>
+                <th>操作</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {items.map((item, index) => {
+                const complete = item.quantity != null && item.unitPrice != null;
+                return (
+                  <tr key={`${record.id}-item-${index}`} className={item.status === "manual_required" ? "itemNeedsReview" : ""}>
+                    <td>{index + 1}</td>
+                    <td><input value={item.itemName || item.name || ""} aria-label={`第 ${index + 1} 列品名`} onChange={(event) => updateItem(index, { itemName: textInput(event.target.value) })} /></td>
+                    <td><input inputMode="decimal" value={item.quantity ?? ""} aria-label={`第 ${index + 1} 列數量`} onChange={(event) => updateItem(index, { quantity: event.target.value.replace(/[^\d.]/g, "") })} /></td>
+                    <td><input inputMode="numeric" value={item.unitPrice ?? ""} aria-label={`第 ${index + 1} 列單價`} onChange={(event) => updateItem(index, { unitPrice: numericInput(event.target.value) })} /></td>
+                    <td>{complete ? Number(item.quantity) * Number(item.unitPrice) : ""}</td>
+                    <td>{Math.round(Number(item.confidence || 0) * 100)}%</td>
+                    <td>{FIELD_SOURCE_LABELS[item.source] || item.source || "人工"}</td>
+                    <td>{item.status === "confirmed" ? "已確認" : complete ? (FIELD_STATUS_LABELS[item.status] || "待確認") : "需人工"}</td>
+                    <td className="lineItemActions">
+                      <button type="button" className="linkButton" onClick={() => confirmItem(index)} disabled={!complete || item.status === "confirmed"}>確認列</button>
+                      <button type="button" className="linkButton dangerText" onClick={() => removeItem(index)}>刪除</button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       ) : (
-        <p className="emptyInline">尚無可匯出的明細列；請確認數量與單價筆數一致。</p>
+        <p className="emptyInline">尚無明細列；請按「新增列」或重新辨識。</p>
       )}
     </div>
   );
@@ -614,7 +743,9 @@ function LineItemsTable({ record }) {
 
 function DebugBlock({ record, templates, onSaveTemplate, onReprocessRecord }) {
   return (
-    <div className="debugSummary">
+    <details className="debugSummary">
+      <summary>進階 / Debug / 模板校正</summary>
+      <div className="debugSummaryBody">
       <h3>Debug / OCR 參考區</h3>
       <dl>
         <div><dt>原圖路徑</dt><dd>{record.imagePath || "-"}</dd></div>
@@ -654,7 +785,8 @@ function DebugBlock({ record, templates, onSaveTemplate, onReprocessRecord }) {
           validationErrors: record.validationErrors || []
         }, null, 2)}</pre>
       </details>
-    </div>
+      </div>
+    </details>
   );
 }
 
