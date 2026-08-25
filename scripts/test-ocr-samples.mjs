@@ -208,6 +208,19 @@ function rootCauseCounts(results) {
   return counts;
 }
 
+function stagePerformanceSummary(results) {
+  const stages = ["intakeMs", "preprocessMs", "localOcrMs", "regionOcrMs", "identityResolverMs", "paddleOcrMs", "mergeMs", "totalMs"];
+  return Object.fromEntries(stages.map((stage) => {
+    const values = results.map((result) => Number(result.performance?.[stage])).filter((value) => Number.isFinite(value));
+    return [stage, values.length ? {
+      samples: values.length,
+      average: values.reduce((sum, value) => sum + value, 0) / values.length,
+      min: Math.min(...values),
+      max: Math.max(...values)
+    } : null];
+  }));
+}
+
 async function run() {
   const samples = sampleFiles();
   if (!samples.length) {
@@ -251,6 +264,7 @@ async function run() {
         manualReview,
         providerFailure,
         processingMs,
+        performance: predictedRecord.debug?.performance || {},
         expected,
         predicted,
         comparison,
@@ -267,6 +281,7 @@ async function run() {
         manualReview: true,
         providerFailure: true,
         processingMs,
+        performance: {},
         expected,
         predicted,
         comparison: compareSample(expected, predicted),
@@ -316,6 +331,7 @@ async function run() {
     zeroEditConfirmationRate: total ? zeroEditConfirmable / total : null,
     zeroEditConfirmable,
     averageProcessingMs: total ? results.reduce((sum, result) => sum + result.processingMs, 0) / total : null,
+    stagePerformance: stagePerformanceSummary(results),
     rootCauses: rootCauseCounts(results)
   };
   const failureMatrix = results.map((result) => ({
@@ -330,6 +346,7 @@ async function run() {
     falsePositiveFields: result.comparison.falsePositiveFields,
     lineItemExactMatch: result.comparison.items.exactMatch,
     lineItemCompleteness: result.comparison.items.completeness,
+    performance: result.performance,
     rootCauses: result.rootCauses,
     error: result.error || ""
   }));

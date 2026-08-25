@@ -7,6 +7,7 @@ import { processInvoiceRecord } from "../lib/server/processInvoice.js";
 import { validateInvoiceRecognition } from "../lib/server/validateInvoiceRecognition.js";
 import { REVIEW_STATUS } from "../lib/server/invoiceStatus.js";
 import { tableLineItemsFromWords } from "../lib/server/anchorExtractor.js";
+import { resolveBuyerTaxIdentity, resolveInvoiceIdentity } from "../lib/server/identityResolver.js";
 import { probeModel } from "../lib/server/providerHealth.js";
 
 function test(name, fn) {
@@ -264,6 +265,44 @@ test("health and doctor expose degradation states", () => {
   assert.ok(doctor.includes('"MISSING"'));
   assert.equal(probeModel({ status: "READY", models: [{ name: "qwen2.5vl:7b" }] }).status, "READY");
   assert.equal(probeModel({ status: "READY", models: [] }).status, "MISSING");
+});
+
+test("identity resolver preserves split invoice evidence and buyer/seller tax separation", () => {
+  const invoice = resolveInvoiceIdentity({
+    words: [
+      { text: "TT", left: 120, top: 100, width: 40, height: 24, confidence: 95 },
+      { text: "00000001", left: 180, top: 104, width: 120, height: 24, confidence: 98 }
+    ],
+    imageWidth: 600,
+    imageHeight: 400
+  });
+  assert.equal(invoice.value, "TT00000001");
+  assert.equal(invoice.selected.anchorRelationship, "invoice-anchor-header-left");
+  assert.ok(invoice.selected.bbox.x2 > invoice.selected.bbox.x1);
+  assert.ok(invoice.selected.evidenceScore >= 0.7);
+  assert.match(invoice.selected.resolverReason, /joined split prefix/);
+
+  const tax = resolveBuyerTaxIdentity({
+    words: [
+      { text: "統一編號", left: 80, top: 150, width: 90, height: 24, confidence: 96 },
+      { text: "12345678", left: 190, top: 152, width: 120, height: 24, confidence: 98 },
+      { text: "營業人蓋用統一發票專用章", left: 400, top: 250, width: 160, height: 24, confidence: 99 },
+      { text: "87654321", left: 450, top: 300, width: 120, height: 24, confidence: 99 }
+    ],
+    invoiceNumber: "TT00000001",
+    imageWidth: 600,
+    imageHeight: 400
+  });
+  assert.equal(tax.value, "12345678");
+  assert.equal(tax.selected.anchorRelationship, "buyer-label-region");
+  assert.ok(tax.candidates.some((candidate) => candidate.anchorRelationship === "seller-region-excluded" && candidate.evidenceScore === 0));
+
+  const unanchored = resolveBuyerTaxIdentity({
+    words: [{ text: "87654321", left: 450, top: 300, width: 120, height: 24, confidence: 99 }],
+    imageWidth: 600,
+    imageHeight: 400
+  });
+  assert.equal(unanchored.value, "");
 });
 
 test("table extraction scales from detected headers", () => {

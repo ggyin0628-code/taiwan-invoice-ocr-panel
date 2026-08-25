@@ -174,34 +174,40 @@ def number_value(value: str) -> int | None:
         return None
 
 
-def field(value: Any, confidence: float, status: str = STATUS_NEEDS_REVIEW) -> dict[str, Any]:
-    return {"value": value, "confidence": confidence, "source": "paddleocr", "status": status}
+def field(value: Any, confidence: float, status: str = STATUS_NEEDS_REVIEW, evidence: list[dict[str, Any]] | None = None, resolver_reason: str = "") -> dict[str, Any]:
+    result = {
+        "value": value,
+        "confidence": confidence,
+        "source": "paddleocr",
+        "status": status,
+        "resolverReason": resolver_reason,
+    }
+    if evidence is not None:
+        result["evidence"] = evidence
+    return result
 
 
-def find_invoice_no(lines: list[dict[str, Any]], image_height: int = 700) -> dict[str, Any]:
-    joined = " ".join(line["text"].upper() for line in lines)
-    match = re.search(r"[A-Z]{2}\s*\d{8}", joined)
-    if match:
-        value = re.sub(r"\s+", "", match.group(0))
-        confidence = max((line["confidence"] for line in lines if value[:2] in line["text"].upper() or value[2:] in digits(line["text"])), default=0.8)
-        return field(value, confidence, STATUS_CONFIRMED if confidence >= 0.85 else STATUS_NEEDS_REVIEW)
+def _bbox_union(*lines: dict[str, Any]) -> dict[str, int]:
+    boxes = [line.get("box") or {} for line in lines if line]
+    return {
+        "x1": int(min((box.get("x1", 0) for box in boxes), default=0)),
+        "y1": int(min((box.get("y1", 0) for box in boxes), default=0)),
+        "x2": int(max((box.get("x2", 0) for box in boxes), default=0)),
+        "y2": int(max((box.get("y2", 0) for box in boxes), default=0)),
+    }
 
-    prefix_candidates = []
-    number_candidates = []
-    for line in lines:
-        text = line["text"].upper()
-        cx, cy = line_center(line)
-        if re.fullmatch(r"[A-Z]{2}", text):
-            prefix_candidates.append((line, cx, cy))
-        if re.fullmatch(r"\d{8}", digits(text)):
-            number_candidates.append((line, cx, cy, digits(text)))
-    for prefix_line, prefix_x, prefix_y in prefix_candidates:
-        prefix = prefix_line["text"].upper()
-        for number_line, number_x, number_y, number in number_candidates:
-            if number_x > prefix_x and abs(number_y - prefix_y) <= max(24, image_height * 0.05) and prefix_y < image_height * 0.26:
-                confidence = min(float(prefix_line["confidence"]), float(number_line["confidence"]))
-                return field(f"{prefix}{number}", confidence, STATUS_CONFIRMED if confidence >= 0.85 else STATUS_NEEDS_REVIEW)
-    return field(None, 0, STATUS_MISSING)
+
+def _identity_evidence(kind: str, raw: str, normalized: str, lines: list[dict[str, Any]], anchor_relationship: str, evidence_score: float, reason: str) -> dict[str, Any]:
+    confidence = min((float(line.get("confidence", 0)) for line in lines), default=0)
+    return {
+        "rawCandidate": raw,
+        "normalizedCandidate": normalized,
+        "bbox": _bbox_union(*lines),
+        "confidence": confidence,
+        "anchorRelationship": anchor_relationship,
+        "evidenceScore": round(max(0.0, min(1.0, evidence_score)), 4),
+        "resolverReason": reason,
+    }
 
 
 def _identity_status(confidence: float) -> str:
@@ -213,58 +219,111 @@ def _eight_digit_candidates(text: str) -> list[str]:
     return [match.group(0) for match in re.finditer(r"\d{8}", normalized)]
 
 
+def find_invoice_no(lines: list[dict[str, Any]], image_height: int = 700) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    for line in lines:
+        raw = str(line.get("text", ""))
+        match = re.search(r"[A-Z]{2}\s*\d{8}", raw.upper())
+        if not match:
+            continue
+        value = re.sub(r"\s+", "", match.group(0)).upper()
+        confidence = float(line.get("confidence", 0))
+        candidates.append({
+            "value": value,
+            "confidence": confidence,
+            "evidence": _identity_evidence("invoice", match.group(0), value, [line], "invoice-header-complete", 0.84 + min(0.14, confidence * 0.1), "complete 2-letter + 8-digit invoice pattern in one OCR box"),
+        })
+
+    prefix_candidates = []
+    number_candidates = []
+    for line in lines:
+        text = str(line.get("text", "")).upper().strip()
+        cx, cy = line_center(line)
+        if re.fullmatch(r"[A-Z]{2}", text):
+            prefix_candidates.append((line, cx, cy))
+        if re.fullmatch(r"\d{8}", digits(text)):
+            number_candidates.append((line, cx, cy, digits(text)))
+    for prefix_line, prefix_x, prefix_y in prefix_candidates:
+        prefix = str(prefix_line["text"]).upper().strip()
+        for number_line, number_x, number_y, number in number_candidates:
+            same_row = abs(number_y - prefix_y) <= max(24, image_height * 0.05)
+            in_header = prefix_y < image_height * 0.26
+            if number_x > prefix_x and same_row and in_header:
+                confidence = min(float(prefix_line["confidence"]), float(number_line["confidence"]))
+                candidates.append({
+                    "value": f"{prefix}{number}",
+                    "confidence": confidence,
+                    "evidence": _identity_evidence("invoice", f"{prefix} + {number}", f"{prefix}{number}", [prefix_line, number_line], "invoice-header-split-same-row", 0.70 + min(0.22, confidence * 0.12), "joined split prefix and number using same-row header geometry"),
+                })
+
+    unique: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        value = candidate["value"]
+        if value not in unique or candidate["evidence"]["evidenceScore"] > unique[value]["evidence"]["evidenceScore"]:
+            unique[value] = candidate
+    ordered = sorted(unique.values(), key=lambda item: (-item["evidence"]["evidenceScore"], -item["confidence"]))
+    if not ordered:
+        return field(None, 0, STATUS_MISSING, [], "no invoice candidate met complete/split header constraints")
+    selected = ordered[0]
+    return field(selected["value"], selected["confidence"], _identity_status(selected["confidence"]), [item["evidence"] for item in ordered], selected["evidence"]["resolverReason"])
+
+
 def find_tax_id(lines: list[dict[str, Any]], image_height: int = 700) -> dict[str, Any]:
-    # OCR may emit either traditional or simplified characters for the buyer label.
-    keyword_re = re.compile(r"([統统]一編號|[統统]編|[買买]受人|營業人)")
-    label_re = re.compile(r"([統统]一編號|[統统]編)")
+    buyer_label_re = re.compile(r"([統统]一編號|[統统]編|[買买]受人)(?!註記|注记)")
+    seller_label_re = re.compile(r"(營業人|营业人|發票專用章|发票专用章)")
     invoice_suffixes = {
         digits(line.get("text", ""))
         for line in lines
         if re.fullmatch(r"[A-Za-z]{2}\s*\d{8}", str(line.get("text", "")))
     }
-    label_lines = [line for line in lines if label_re.search(str(line.get("text", "")))]
-    for label in label_lines:
+    buyer_labels = [line for line in lines if buyer_label_re.search(str(line.get("text", "")))]
+    all_numbers = [(line, value) for line in lines for value in _eight_digit_candidates(str(line.get("text", ""))) if value not in invoice_suffixes]
+    candidates: list[dict[str, Any]] = []
+    for label in buyer_labels:
         label_x, label_y = line_center(label)
-        # A combined OCR line often contains the label, buyer ID, and date together.
-        inline = [candidate for candidate in _eight_digit_candidates(str(label.get("text", ""))) if candidate not in invoice_suffixes]
-        if inline:
-            confidence = float(label.get("confidence", 0))
-            return field(inline[0], confidence, _identity_status(confidence))
-
-        same_row_numbers: list[tuple[float, float, str]] = []
-        for line in lines:
+        inline_values = [value for value in _eight_digit_candidates(str(label.get("text", ""))) if value not in invoice_suffixes]
+        for value in inline_values:
+            candidates.append({
+                "value": value,
+                "confidence": float(label.get("confidence", 0)),
+                "evidence": _identity_evidence("tax", str(label.get("text", "")), value, [label], "buyer-anchor-inline", 0.86, "buyer tax label and 8-digit value occur in one OCR box"),
+            })
+        for line, value in all_numbers:
             cx, cy = line_center(line)
-            if cx <= label_x or abs(cy - label_y) > max(24, image_height * 0.05):
+            same_row = abs(cy - label_y) <= max(24, image_height * 0.05) and cx > label_x
+            close_below = 0 < cy - label_y <= max(42, image_height * 0.065) and abs(cx - label_x) <= max(260, image_height * 0.24)
+            if not (same_row or close_below):
                 continue
-            for value in _eight_digit_candidates(str(line.get("text", ""))):
-                if value not in invoice_suffixes:
-                    same_row_numbers.append((cx - label_x, float(line.get("confidence", 0)), value))
-        if same_row_numbers:
-            _, confidence, value = sorted(same_row_numbers, key=lambda item: item[0])[0]
-            return field(value, confidence, _identity_status(confidence))
+            confidence = min(float(label.get("confidence", 0)), float(line.get("confidence", 0)))
+            candidates.append({
+                "value": value,
+                "confidence": confidence,
+                "evidence": _identity_evidence("tax", str(line.get("text", "")), value, [label, line], "buyer-anchor-same-row" if same_row else "buyer-anchor-near-below", 0.82 if same_row else 0.72, "buyer label ranked above nearest same-row/near-below numeric candidate"),
+            })
 
-    candidates: list[tuple[int, float, str]] = []
-    for index, line in enumerate(lines):
-        text = str(line.get("text", ""))
-        if not keyword_re.search(text):
-            continue
-        window = " ".join(next_line.get("text", "") for next_line in lines[index : index + 4])
-        for value in _eight_digit_candidates(window):
-            if value not in invoice_suffixes:
-                candidates.append((index, float(line.get("confidence", 0)), value))
-    if not candidates:
-        for line in lines:
-            top = float((line.get("box") or {}).get("y1", 0) or 0)
-            left = float((line.get("box") or {}).get("x1", 0) or 0)
-            if top >= image_height * 0.40 or left >= 900:
-                continue
-            for value in _eight_digit_candidates(str(line.get("text", ""))):
-                if value not in invoice_suffixes:
-                    candidates.append((999, float(line.get("confidence", 0)), value))
-    if not candidates:
-        return field(None, 0, STATUS_MISSING)
-    _, confidence, value = sorted(candidates, key=lambda item: (-item[1], item[0]))[0]
-    return field(value, confidence, _identity_status(confidence))
+    # Keep seller/stamp numbers only as rejected evidence for diagnostics; never select them as buyer tax IDs.
+    for line, value in all_numbers:
+        box = line.get("box") or {}
+        if float(box.get("x1", 0)) >= 0.68 * 1200 or float(box.get("y1", 0)) >= image_height * 0.40:
+            if seller_label_re.search(" ".join(str(item.get("text", "")) for item in lines if (item.get("box") or {}).get("x1", 0) >= 700)):
+                candidates.append({
+                    "value": value,
+                    "confidence": float(line.get("confidence", 0)),
+                    "evidence": _identity_evidence("tax", str(line.get("text", "")), value, [line], "seller-region-excluded", 0.0, "seller/stamp region candidate excluded from buyer tax resolver"),
+                })
+
+    unique: dict[tuple[str, str], dict[str, Any]] = {}
+    for candidate in candidates:
+        key = (candidate["value"], candidate["evidence"]["anchorRelationship"])
+        if key not in unique or candidate["evidence"]["evidenceScore"] > unique[key]["evidence"]["evidenceScore"]:
+            unique[key] = candidate
+    ordered = sorted(unique.values(), key=lambda item: (-item["evidence"]["evidenceScore"], -item["confidence"]))
+    eligible = [item for item in ordered if item["evidence"]["evidenceScore"] >= 0.70]
+    if not eligible:
+        reason = "buyer anchor found but no non-colliding candidate met geometry threshold" if buyer_labels else "buyer tax anchor missing; unrelated eight-digit values rejected"
+        return field(None, 0, STATUS_MISSING, [item["evidence"] for item in ordered], reason)
+    selected = eligible[0]
+    return field(selected["value"], selected["confidence"], _identity_status(selected["confidence"]), [item["evidence"] for item in ordered], selected["evidence"]["resolverReason"])
 
 
 def line_center(line: dict[str, Any]) -> tuple[float, float]:
