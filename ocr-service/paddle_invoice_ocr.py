@@ -540,7 +540,7 @@ def extract_items(lines: list[dict[str, Any]], image_width: int = 1200, image_he
 
 def _summary_kind(text: str) -> str | None:
     value = str(text or "")
-    if re.search(r"稅額|税额|營業稅|营业税|稅金|税金|tax", value, re.I):
+    if re.search(r"稅額|税额|營業稅|营业税|營業税|营业稅|稅金|税金|tax", value, re.I):
         return "taxAmount"
     if re.search(r"總計|总计|總額|总额|應收|应收|合計金額|合计金额|total", value, re.I):
         return "totalAmount"
@@ -553,7 +553,7 @@ def _money_candidates(text: str) -> list[tuple[str, int]]:
     candidates: list[tuple[str, int]] = []
     # Numeric-only financial scope: allow bounded OCR glyph confusions, never global text replacement.
     normalized = str(text or "").translate(str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1", "|": "1", "S": "5", "s": "5", "B": "8", "Z": "2"}))
-    for match in re.finditer(r"\d[\d,]*", normalized):
+    for match in re.finditer(r"\d[\d,.]*", normalized):
         raw = match.group(0)
         value = number_value(raw)
         if value is not None and value > 0:
@@ -654,7 +654,20 @@ def extract_summary_amounts(lines: list[dict[str, Any]], image_width: int = 1200
             near_below = 0 < line_y - label_y <= max(60, image_height * 0.09) and abs(line_x - label_x) <= max(320, image_width * 0.30)
             if not (same_row or near_below) or line_y < image_height * 0.42:
                 continue
-            for raw, value in _money_candidates(str(line.get("text", ""))):
+            line_text = str(line.get("text", "")).strip()
+            mostly_numeric = bool(re.fullmatch(r"[\d\s,.:>|IlLOSOB]+", line_text.upper()))
+            if not mostly_numeric:
+                continue
+            for raw, value in _money_candidates(line_text):
+                line_digits = digits(raw)
+                if len(line_digits) >= 8:
+                    continue
+                line_center_x, line_center_y = line_center(line)
+                value_column = image_width * 0.42 <= line_center_x <= image_width * 0.84
+                vertical_gap = abs(line_center_y - label_y)
+                close_summary_band = vertical_gap <= max(46, image_height * 0.07)
+                if not (value_column and close_summary_band):
+                    continue
                 candidates[kind].append({"value": value, "raw": raw, "lines": [label, line], "relation": "summary-label-neighbor"})
     output: dict[str, dict[str, Any] | None] = {"salesAmount": None, "taxAmount": None, "totalAmount": None}
     for kind, values in candidates.items():
