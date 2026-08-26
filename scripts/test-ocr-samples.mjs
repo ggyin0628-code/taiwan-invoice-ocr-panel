@@ -1,5 +1,5 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { copyFile, mkdir, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { processInvoiceRecord } from "../lib/server/processInvoice.js";
@@ -8,29 +8,20 @@ import { fromDataRelativePath, toDataRelativePath, UPLOADS_DIR } from "../lib/se
 const root = process.cwd();
 const samplesDir = process.env.OCR_SAMPLES_DIR || join(root, "samples-private");
 const groundTruthPath = process.env.OCR_GROUND_TRUTH || join(root, "ground-truth-private.json");
+const documentGroupingPath = process.env.OCR_DOCUMENT_GROUPING || join(root, "document-grouping-private.json");
+const documentGroundTruthPath = process.env.OCR_DOCUMENT_GROUND_TRUTH || join(root, "document-ground-truth-private.json");
 const benchmarkDir = process.env.OCR_BENCHMARK_DIR || join(root, ".ocr-benchmark");
 const supportedImage = /\.(jpe?g|png|webp|tiff?)$/i;
 const scalarFields = ["invoiceNumber", "buyerTaxId", "salesAmount", "taxAmount", "totalAmount"];
 const itemFields = ["itemName", "quantity", "unitPrice", "amount"];
 const rootCauseLabels = [
-  "document detection",
-  "orientation",
-  "perspective correction",
-  "OCR recognition",
-  "layout resolver",
-  "field resolver",
-  "row grouping",
-  "invoice number",
-  "tax ID",
-  "quantity",
-  "unit price",
-  "formula validation",
-  "provider unavailable",
-  "other"
+  "document detection", "orientation", "perspective correction", "OCR recognition", "layout resolver",
+  "field resolver", "row grouping", "invoice number", "tax ID", "quantity", "unit price",
+  "formula validation", "provider unavailable", "other"
 ];
 
 function normalizeText(value) {
-  return String(value ?? "").replace(/\s+/g, "").trim();
+  return String(value ?? "").normalize("NFKC").replace(/\s+/g, "").trim();
 }
 
 function normalizeNumber(value) {
@@ -44,29 +35,29 @@ function normalizeItems(items) {
     itemName: normalizeText(item?.itemName ?? item?.name ?? ""),
     quantity: normalizeNumber(item?.quantity),
     unitPrice: normalizeNumber(item?.unitPrice ?? item?.unit_price),
-    amount: normalizeNumber(item?.amount)
+    amount: normalizeNumber(item?.amount ?? item?.salesAmount)
   }));
 }
 
 function normalizeExpected(expected = {}) {
   return {
     invoiceNumber: normalizeText(expected.invoiceNumber),
-    buyerTaxId: normalizeText(expected.buyerTaxId),
-    items: normalizeItems(expected.items),
-    salesAmount: normalizeNumber(expected.salesAmount),
-    taxAmount: normalizeNumber(expected.taxAmount),
-    totalAmount: normalizeNumber(expected.totalAmount)
+    buyerTaxId: normalizeText(expected.buyerTaxId ?? expected.taxId),
+    items: normalizeItems(expected.items ?? expected.expectedLineItems),
+    salesAmount: normalizeNumber(expected.salesAmount ?? expected.subtotal),
+    taxAmount: normalizeNumber(expected.taxAmount ?? expected.tax),
+    totalAmount: normalizeNumber(expected.totalAmount ?? expected.total)
   };
 }
 
 function normalizePredicted(record = {}) {
   return {
-    invoiceNumber: normalizeText(record.invoiceNumber),
-    buyerTaxId: normalizeText(record.taxId),
+    invoiceNumber: normalizeText(record.invoiceNumber ?? record.invoiceNo),
+    buyerTaxId: normalizeText(record.taxId ?? record.buyerTaxId),
     items: normalizeItems(record.items),
-    salesAmount: normalizeNumber(record.salesAmount),
-    taxAmount: normalizeNumber(record.taxAmount),
-    totalAmount: normalizeNumber(record.totalAmount)
+    salesAmount: normalizeNumber(record.salesAmount ?? record.amount),
+    taxAmount: normalizeNumber(record.taxAmount ?? record.tax),
+    totalAmount: normalizeNumber(record.totalAmount ?? record.total)
   };
 }
 
@@ -87,11 +78,37 @@ function hasPredictedValue(field, predicted) {
   return field === "items" ? predicted.items.length > 0 : hasValue(predicted[field]);
 }
 
+function loadJson(path, label) {
+  if (!existsSync(path)) throw new Error(`找不到 ${label}：${path}`);
+  return JSON.parse(readFileSync(path, "utf8"));
+}
+
 function loadGroundTruth() {
-  if (!existsSync(groundTruthPath)) throw new Error(`找不到 ground truth：${groundTruthPath}`);
-  const raw = JSON.parse(readFileSync(groundTruthPath, "utf8"));
+  const raw = loadJson(groundTruthPath, "ground truth");
   if (Array.isArray(raw)) return Object.fromEntries(raw.map((entry) => [entry.filename, entry]));
+  if (raw && typeof raw === "object" && raw.entries && typeof raw.entries === "object") return raw.entries;
   return raw && typeof raw === "object" ? raw : {};
+}
+
+function loadDocumentGrouping() {
+  const raw = loadJson(documentGroupingPath, "document grouping");
+  const documents = Array.isArray(raw) ? raw : raw.documents;
+  if (!Array.isArray(documents) || !documents.length) throw new Error(`document grouping schema 不完整：${documentGroupingPath}`);
+  const imageToDocument = {};
+  for (const document of documents) {
+    const documentId = String(document.documentId || "");
+    const images = document.sourceImageIds || document.sourcePageIds || document.images || [];
+    if (!documentId || !Array.isArray(images) || !images.length) throw new Error("document grouping 含無效 document entry");
+    for (const image of images) imageToDocument[basename(String(image))] = documentId;
+  }
+  return { documents, imageToDocument };
+}
+
+function loadDocumentGroundTruth() {
+  const raw = loadJson(documentGroundTruthPath, "document ground truth");
+  const documents = Array.isArray(raw) ? raw : raw.documents;
+  if (!Array.isArray(documents) || !documents.length) throw new Error(`document ground truth schema 不完整：${documentGroundTruthPath}`);
+  return Object.fromEntries(documents.map((entry) => [String(entry.documentId), normalizeExpected(entry)]));
 }
 
 function sampleFiles() {
@@ -118,7 +135,7 @@ function compareItems(expectedItems, predictedItems) {
   const expectedCount = expectedItems.length;
   const predictedCount = predictedItems.length;
   const completeRows = expectedCount
-    ? predictedItems.slice(0, expectedCount).filter((item) => ["quantity", "unitPrice", "amount"].every((field) => hasValue(item[field]))).length
+    ? predictedItems.slice(0, expectedCount).filter((item) => itemFields.every((field) => hasValue(item[field]))).length
     : predictedCount === 0 ? 1 : 0;
   const exactRows = expectedItems.filter((expected, index) => predictedItems[index] && itemFields.every((field) => expected[field] === predictedItems[index][field])).length;
   return {
@@ -127,7 +144,9 @@ function compareItems(expectedItems, predictedItems) {
     predictedCount,
     exactRows,
     exactRowRate: expectedCount ? exactRows / expectedCount : predictedCount === 0 ? 1 : 0,
-    completeness: expectedCount ? completeRows / expectedCount : predictedCount === 0 ? 1 : 0
+    completeness: expectedCount ? completeRows / expectedCount : predictedCount === 0 ? 1 : 0,
+    missingRows: Math.max(0, expectedCount - predictedCount),
+    extraRows: Math.max(0, predictedCount - expectedCount)
   };
 }
 
@@ -158,11 +177,7 @@ function compareSample(expected, predicted) {
 function loadDebug(result) {
   const path = result?.debug;
   if (!path) return null;
-  try {
-    return JSON.parse(readFileSync(fromDataRelativePath(path), "utf8"));
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(readFileSync(fromDataRelativePath(path), "utf8")); } catch { return null; }
 }
 
 function classifyRootCauses(result) {
@@ -177,7 +192,7 @@ function classifyRootCauses(result) {
   if (debug?.documentDetection && ["perspective", "skew", "homography"].some((key) => debug.documentDetection[key])) causes.add("perspective correction");
   if (comparison.fieldResults.invoiceNumber === false) causes.add(hasValue(predicted.invoiceNumber) ? "OCR recognition" : "invoice number");
   if (comparison.fieldResults.buyerTaxId === false) causes.add(hasValue(predicted.buyerTaxId) ? "OCR recognition" : "tax ID");
-  if (comparison.fieldResults.salesAmount === false || comparison.fieldResults.taxAmount === false || comparison.fieldResults.totalAmount === false) causes.add("formula validation");
+  if (["salesAmount", "taxAmount", "totalAmount"].some((field) => comparison.fieldResults[field] === false)) causes.add("formula validation");
   if (expected.items.length !== predicted.items.length) causes.add("row grouping");
   if (expected.items.length && !predicted.items.length) causes.add("layout resolver");
   expected.items.forEach((expectedItem, index) => {
@@ -195,11 +210,22 @@ function classifyRootCauses(result) {
 
 function metricForField(results, field) {
   const eligible = results.filter((result) => hasExpectedValue(field, result.expected));
-  return {
-    correct: eligible.filter((result) => result.comparison.fieldResults[field]).length,
-    total: eligible.length,
-    accuracy: eligible.length ? eligible.filter((result) => result.comparison.fieldResults[field]).length / eligible.length : null
-  };
+  const correct = eligible.filter((result) => result.comparison.fieldResults[field]).length;
+  return { correct, total: eligible.length, accuracy: eligible.length ? correct / eligible.length : null };
+}
+
+function cellMetric(results, field) {
+  let correct = 0;
+  let total = 0;
+  for (const result of results) {
+    const expectedItems = result.expected.items || [];
+    const predictedItems = result.predicted.items || [];
+    for (let index = 0; index < expectedItems.length; index += 1) {
+      total += 1;
+      if (predictedItems[index] && expectedItems[index][field] === predictedItems[index][field]) correct += 1;
+    }
+  }
+  return { correct, total, accuracy: total ? correct / total : null };
 }
 
 function rootCauseCounts(results) {
@@ -209,16 +235,119 @@ function rootCauseCounts(results) {
 }
 
 function stagePerformanceSummary(results) {
-  const stages = ["intakeMs", "preprocessMs", "localOcrMs", "regionOcrMs", "identityResolverMs", "paddleOcrMs", "targetedRoiPreprocessMs", "targetedRoiOcrMs", "targetedRoiTotalMs", "targetedRoiMs", "mergeMs", "totalMs"];
+  const stages = ["intakeMs", "preprocessMs", "localOcrMs", "regionOcrMs", "identityResolverMs", "paddleOcrMs", "targetedRoiPreprocessMs", "targetedRoiOcrMs", "targetedRoiTotalMs", "targetedRoiMs", "targetedTablePreprocessMs", "targetedTableOcrMs", "targetedTableTotalMs", "targetedTableMs", "mergeMs", "totalMs"];
   return Object.fromEntries(stages.map((stage) => {
     const values = results.map((result) => Number(result.performance?.[stage])).filter((value) => Number.isFinite(value));
-    return [stage, values.length ? {
-      samples: values.length,
-      average: values.reduce((sum, value) => sum + value, 0) / values.length,
-      min: Math.min(...values),
-      max: Math.max(...values)
-    } : null];
+    return [stage, values.length ? { samples: values.length, average: values.reduce((sum, value) => sum + value, 0) / values.length, min: Math.min(...values), max: Math.max(...values) } : null];
   }));
+}
+
+function aggregateMetrics(results, level) {
+  const total = results.length;
+  const exactComplete = results.filter((result) => result.comparison.items.completeness === 1).length;
+  const exactLines = results.filter((result) => result.comparison.items.exactMatch).length;
+  const totalExpectedRows = results.reduce((sum, result) => sum + result.expected.items.length, 0);
+  const totalExactRows = results.reduce((sum, result) => sum + result.comparison.items.exactRows, 0);
+  const totalMissingRows = results.reduce((sum, result) => sum + result.comparison.items.missingRows, 0);
+  const totalExtraRows = results.reduce((sum, result) => sum + result.comparison.items.extraRows, 0);
+  const processing = results.map((result) => Number(result.processingMs)).filter(Number.isFinite);
+  const metrics = {
+    level,
+    totalUnits: total,
+    successfullyProcessed: results.filter((result) => result.processingStatus !== "failed").length,
+    providerFailures: results.filter((result) => result.providerFailure).length,
+    providerFailureRate: total ? results.filter((result) => result.providerFailure).length / total : null,
+    invoiceNumber: metricForField(results, "invoiceNumber"),
+    buyerTaxId: metricForField(results, "buyerTaxId"),
+    quantity: cellMetric(results, "quantity"),
+    unitPrice: cellMetric(results, "unitPrice"),
+    itemName: cellMetric(results, "itemName"),
+    amountCell: cellMetric(results, "amount"),
+    salesAmount: metricForField(results, "salesAmount"),
+    taxAmount: metricForField(results, "taxAmount"),
+    totalAmount: metricForField(results, "totalAmount"),
+    lineItemExactMatch: { correct: exactLines, total, accuracy: total ? exactLines / total : null },
+    lineItemCompleteness: { average: total ? results.reduce((sum, result) => sum + result.comparison.items.completeness, 0) / total : null, exactCompleteUnits: exactComplete, total },
+    expectedRowCount: totalExpectedRows,
+    exactRowCells: { correct: totalExactRows, total: totalExpectedRows, accuracy: totalExpectedRows ? totalExactRows / totalExpectedRows : null },
+    missingRows: totalMissingRows,
+    extraRows: totalExtraRows,
+    rowCountExact: { correct: results.filter((result) => result.comparison.items.expectedCount === result.comparison.items.predictedCount).length, total, accuracy: total ? results.filter((result) => result.comparison.items.expectedCount === result.comparison.items.predictedCount).length / total : null },
+    exactMatch: { correct: results.filter((result) => result.comparison.exactMatch).length, total, accuracy: total ? results.filter((result) => result.comparison.exactMatch).length / total : null },
+    fieldAccuracy: total ? results.reduce((sum, result) => sum + result.comparison.fieldAccuracy, 0) / total : null,
+    reviewRecommendedRate: total ? results.filter((result) => result.reviewStatus === "REVIEW_RECOMMENDED").length / total : null,
+    reviewRequiredRate: total ? results.filter((result) => ["REVIEW_REQUIRED", "INVALID"].includes(result.reviewStatus)).length / total : null,
+    zeroEditConfirmationRate: total ? results.filter((result) => result.comparison.exactMatch && result.reviewStatus === "AUTO_OK" && result.processingStatus === "done" && !result.providerFailure).length / total : null,
+    averageProcessingMs: processing.length ? processing.reduce((sum, value) => sum + value, 0) / processing.length : null
+  };
+  return metrics;
+}
+
+function itemSignature(item) {
+  return [item.itemName, item.quantity, item.unitPrice, item.amount].map((value) => String(value ?? "")).join("|");
+}
+
+function mergeDocumentItems(pageResults) {
+  const merged = [];
+  const provenance = [];
+  for (const page of pageResults) {
+    for (const [index, item] of page.predicted.items.entries()) {
+      const signature = itemSignature(item);
+      let target = merged.findIndex((candidate) => candidate.signature === signature);
+      if (target < 0) {
+        target = merged.length;
+        merged.push({ ...item, signature, sourcePages: [page.filename], sourceRows: [index + 1], agreement: 1, conflicts: [] });
+      } else {
+        merged[target].agreement += 1;
+        merged[target].sourcePages.push(page.filename);
+        merged[target].sourceRows.push(index + 1);
+      }
+    }
+  }
+  for (const item of merged) {
+    const { signature, sourcePages, sourceRows, ...canonical } = item;
+    provenance.push({ sourcePageCount: sourcePages.length, sourceRowCount: sourceRows.length, agreement: item.agreement, conflictCount: item.conflicts.length });
+    Object.assign(item, { sourcePages, sourceRows });
+  }
+  return { items: merged.map(({ signature, sourcePages, sourceRows, agreement, conflicts, ...item }) => ({ ...item, sourcePages, sourceRows, agreement, conflicts })), provenance };
+}
+
+function mergeDocumentResults(grouping, documentTruth, imageResults) {
+  const byFilename = Object.fromEntries(imageResults.map((result) => [result.filename, result]));
+  const documents = [];
+  for (const group of grouping.documents) {
+    const documentId = String(group.documentId);
+    const pageIds = group.sourceImageIds || group.sourcePageIds || group.images || [];
+    const pageResults = pageIds.map((page) => byFilename[basename(String(page))]).filter(Boolean);
+    const expected = documentTruth[documentId];
+    if (!expected) throw new Error(`document ground truth 缺少 ${documentId}`);
+    const mergedItems = mergeDocumentItems(pageResults);
+    const first = pageResults[0] || {};
+    const predicted = {
+      invoiceNumber: first.predicted?.invoiceNumber || "",
+      buyerTaxId: first.predicted?.buyerTaxId || "",
+      items: mergedItems.items,
+      salesAmount: first.predicted?.salesAmount ?? null,
+      taxAmount: first.predicted?.taxAmount ?? null,
+      totalAmount: first.predicted?.totalAmount ?? null
+    };
+    const comparison = compareSample(expected, predicted);
+    documents.push({ documentId, sourceImageIds: pageIds.map(String), observationCount: pageResults.length, expected, predicted, comparison, mergeEvidence: mergedItems.provenance });
+  }
+  return documents;
+}
+
+function invocationSummary(results) {
+  const sum = (key) => results.reduce((total, result) => total + Number(result.performance?.[key] || 0), 0);
+  const total = results.length;
+  return {
+    fullPageTotal: sum("fullPagePaddleOcrInvocationCount"),
+    fullPageAveragePerSample: total ? sum("fullPagePaddleOcrInvocationCount") / total : 0,
+    targetedRoiTotal: sum("targetedRoiInvocationCount"),
+    targetedTableTotal: sum("targetedTableInvocationCount"),
+    samplesWithTargetedRoiRecovery: results.filter((result) => Number(result.performance?.targetedRoiInvocationCount || 0) > 0).length,
+    samplesWithTargetedTableRecovery: results.filter((result) => Number(result.performance?.targetedTableInvocationCount || 0) > 0).length
+  };
 }
 
 async function run() {
@@ -229,24 +358,22 @@ async function run() {
     return;
   }
   const groundTruth = loadGroundTruth();
-  const missingTruth = samples.map((samplePath) => basename(samplePath)).filter((filename) => !validGroundTruthEntry(groundTruth[filename]));
+  const grouping = loadDocumentGrouping();
+  const documentTruth = loadDocumentGroundTruth();
+  const missingTruth = samples.map((samplePath) => basename(samplePath)).filter((filename) => !validGroundTruthEntry(normalizeExpected(groundTruth[filename])));
   if (missingTruth.length) throw new Error(`ground truth 缺少或 schema 不完整：${missingTruth.join(", ")}`);
+  const missingGrouping = samples.map((samplePath) => basename(samplePath)).filter((filename) => !grouping.imageToDocument[filename]);
+  if (missingGrouping.length) throw new Error(`document grouping 缺少 image：${missingGrouping.join(", ")}`);
 
   const batchId = `TLOCAL-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}`;
   const uploadDir = join(UPLOADS_DIR, batchId);
   await mkdir(uploadDir, { recursive: true });
   const results = [];
-
   for (const samplePath of samples) {
     const filename = basename(samplePath);
     const storedPath = join(uploadDir, filename);
     await copyFile(samplePath, storedPath);
-    const record = {
-      id: `${batchId}-${results.length + 1}`,
-      batchId,
-      filename,
-      imagePath: toDataRelativePath(storedPath)
-    };
+    const record = { id: `${batchId}-${results.length + 1}`, batchId, filename, imagePath: toDataRelativePath(storedPath) };
     const expected = normalizeExpected(groundTruth[filename]);
     const startedAt = performance.now();
     try {
@@ -256,120 +383,37 @@ async function run() {
       const comparison = compareSample(expected, predicted);
       const manualReview = predictedRecord.reviewStatus !== "AUTO_OK" || ["need_review", "provider_unavailable", "failed"].includes(predictedRecord.processingStatus);
       const providerFailure = predictedRecord.providerStatus === "provider_unavailable" || predictedRecord.processingStatus === "provider_unavailable" || predictedRecord.processingStatus === "failed";
-      results.push({
-        filename,
-        processingStatus: predictedRecord.processingStatus,
-        reviewStatus: predictedRecord.reviewStatus || "UNKNOWN",
-        providerStatus: predictedRecord.providerStatus || "UNKNOWN",
-        manualReview,
-        providerFailure,
-        processingMs,
-        performance: predictedRecord.debug?.performance || {},
-        expected,
-        predicted,
-        comparison,
-        debug: predictedRecord.debug?.ocrJsonPath || ""
-      });
+      results.push({ filename, documentId: grouping.imageToDocument[filename], processingStatus: predictedRecord.processingStatus, reviewStatus: predictedRecord.reviewStatus || "UNKNOWN", providerStatus: predictedRecord.providerStatus || "UNKNOWN", manualReview, providerFailure, processingMs, performance: predictedRecord.debug?.performance || {}, expected, predicted, comparison, debug: predictedRecord.debug?.ocrJsonPath || "" });
     } catch (error) {
       const processingMs = performance.now() - startedAt;
       const predicted = normalizePredicted({});
-      results.push({
-        filename,
-        processingStatus: "failed",
-        reviewStatus: "FAILED",
-        providerStatus: "failed",
-        manualReview: true,
-        providerFailure: true,
-        processingMs,
-        performance: {},
-        expected,
-        predicted,
-        comparison: compareSample(expected, predicted),
-        debug: "",
-        error: error?.message || "OCR failed"
-      });
+      results.push({ filename, documentId: grouping.imageToDocument[filename], processingStatus: "failed", reviewStatus: "FAILED", providerStatus: "failed", manualReview: true, providerFailure: true, processingMs, performance: {}, expected, predicted, comparison: compareSample(expected, predicted), debug: "", error: error?.message || "OCR failed" });
     }
   }
-
   for (const result of results) result.rootCauses = classifyRootCauses(result);
-  const total = results.length;
-  const successfullyProcessed = results.filter((result) => result.processingStatus !== "failed").length;
-  const zeroEditConfirmable = results.filter((result) => result.comparison.exactMatch && result.reviewStatus === "AUTO_OK" && result.processingStatus === "done" && !result.providerFailure).length;
+  const documentResults = mergeDocumentResults(grouping, documentTruth, results);
   const metrics = {
-    totalSamples: total,
-    successfullyProcessed,
+    metricSchemaVersion: "r2-recovered-v1",
+    imageLevelMetrics: aggregateMetrics(results, "image"),
+    documentLevelMetrics: aggregateMetrics(documentResults, "document"),
+    totalSamples: results.length,
+    successfullyProcessed: results.filter((result) => result.processingStatus !== "failed").length,
     providerFailures: results.filter((result) => result.providerFailure).length,
-    providerFailureRate: total ? results.filter((result) => result.providerFailure).length / total : null,
-    invoiceNumber: metricForField(results, "invoiceNumber"),
-    buyerTaxId: metricForField(results, "buyerTaxId"),
-    quantity: {
-      correct: results.reduce((sum, result) => sum + result.comparison.items.expectedCount - result.comparison.items.exactRows, 0) === 0 ? results.reduce((sum, result) => sum + result.comparison.items.exactRows, 0) : results.reduce((sum, result) => sum + result.comparison.items.exactRows, 0),
-      total: results.reduce((sum, result) => sum + result.comparison.items.expectedCount, 0),
-      accuracy: results.reduce((sum, result) => sum + result.comparison.items.expectedCount, 0) ? results.reduce((sum, result) => sum + result.comparison.items.exactRows, 0) / results.reduce((sum, result) => sum + result.comparison.items.expectedCount, 0) : null
-    },
-    unitPrice: {
-      correct: results.reduce((sum, result) => sum + result.expected.items.filter((item, index) => result.predicted.items[index]?.unitPrice === item.unitPrice).length, 0),
-      total: results.reduce((sum, result) => sum + result.expected.items.length, 0),
-      accuracy: results.reduce((sum, result) => sum + result.expected.items.length, 0) ? results.reduce((sum, result) => sum + result.expected.items.filter((item, index) => result.predicted.items[index]?.unitPrice === item.unitPrice).length, 0) / results.reduce((sum, result) => sum + result.expected.items.length, 0) : null
-    },
-    salesAmount: metricForField(results, "salesAmount"),
-    taxAmount: metricForField(results, "taxAmount"),
-    totalAmount: metricForField(results, "totalAmount"),
-    lineItemExactMatch: {
-      correct: results.filter((result) => result.comparison.items.exactMatch).length,
-      total,
-      accuracy: total ? results.filter((result) => result.comparison.items.exactMatch).length / total : null
-    },
-    lineItemCompleteness: {
-      average: total ? results.reduce((sum, result) => sum + result.comparison.items.completeness, 0) / total : null,
-      exactCompleteSamples: results.filter((result) => result.comparison.items.completeness === 1).length,
-      total
-    },
-    fieldAccuracy: total ? results.reduce((sum, result) => sum + result.comparison.fieldAccuracy, 0) / total : null,
-    reviewRecommendedRate: total ? results.filter((result) => result.reviewStatus === "REVIEW_RECOMMENDED").length / total : null,
-    reviewRequiredRate: total ? results.filter((result) => ["REVIEW_REQUIRED", "INVALID"].includes(result.reviewStatus)).length / total : null,
-    zeroEditConfirmationRate: total ? zeroEditConfirmable / total : null,
-    zeroEditConfirmable,
-    averageProcessingMs: total ? results.reduce((sum, result) => sum + result.processingMs, 0) / total : null,
+    providerFailureRate: results.length ? results.filter((result) => result.providerFailure).length / results.length : null,
+    averageProcessingMs: results.length ? results.reduce((sum, result) => sum + result.processingMs, 0) / results.length : null,
     stagePerformance: stagePerformanceSummary(results),
-    paddleInvocation: {
-      fullPageTotal: results.reduce((sum, result) => sum + Number(result.performance?.fullPagePaddleOcrInvocationCount || 0), 0),
-      fullPageAveragePerSample: total ? results.reduce((sum, result) => sum + Number(result.performance?.fullPagePaddleOcrInvocationCount || 0), 0) / total : 0,
-      targetedTotal: results.reduce((sum, result) => sum + Number(result.performance?.targetedRoiInvocationCount || 0), 0),
-      targetedAveragePerSample: total ? results.reduce((sum, result) => sum + Number(result.performance?.targetedRoiInvocationCount || 0), 0) / total : 0,
-      samplesWithTargetedRecovery: results.filter((result) => Number(result.performance?.targetedRoiInvocationCount || 0) > 0).length
-    },
-    rootCauses: rootCauseCounts(results)
+    paddleInvocation: invocationSummary(results),
+    rootCauses: rootCauseCounts(results),
+    documentCount: documentResults.length,
+    canonicalRowCount: documentResults.reduce((sum, result) => sum + result.expected.items.length, 0)
   };
-  const failureMatrix = results.map((result) => ({
-    filename: result.filename,
-    processed: result.processingStatus !== "failed",
-    processingStatus: result.processingStatus,
-    processingMs: result.processingMs,
-    providerStatus: result.providerStatus,
-    reviewStatus: result.reviewStatus,
-    fieldResults: result.comparison.fieldResults,
-    missingFields: result.comparison.missingFields,
-    falsePositiveFields: result.comparison.falsePositiveFields,
-    lineItemExactMatch: result.comparison.items.exactMatch,
-    lineItemCompleteness: result.comparison.items.completeness,
-    performance: result.performance,
-    rootCauses: result.rootCauses,
-    error: result.error || ""
-  }));
-  const output = {
-    generatedAt: new Date().toISOString(),
-    samplesDir,
-    groundTruthPath,
-    metrics,
-    failureMatrix,
-    results
-  };
+  const failureMatrix = results.map((result) => ({ filename: result.filename, documentId: result.documentId, processed: result.processingStatus !== "failed", processingStatus: result.processingStatus, processingMs: result.processingMs, providerStatus: result.providerStatus, reviewStatus: result.reviewStatus, fieldResults: result.comparison.fieldResults, missingFields: result.comparison.missingFields, falsePositiveFields: result.comparison.falsePositiveFields, lineItemExactMatch: result.comparison.items.exactMatch, lineItemCompleteness: result.comparison.items.completeness, missingRows: result.comparison.items.missingRows, extraRows: result.comparison.items.extraRows, performance: result.performance, rootCauses: result.rootCauses, error: result.error || "" }));
+  const output = { generatedAt: new Date().toISOString(), samplesDir, groundTruthPath, documentGroupingPath, documentGroundTruthPath, metrics, failureMatrix, results, documentResults };
   await mkdir(benchmarkDir, { recursive: true });
   const outputPath = join(benchmarkDir, `ocr-results-${output.generatedAt.replace(/[-:.TZ]/g, "").slice(0, 14)}.json`);
   await writeFile(outputPath, `${JSON.stringify(output, null, 2)}\n`, "utf8");
   await writeFile(join(benchmarkDir, "latest.json"), `${JSON.stringify(output, null, 2)}\n`, "utf8");
-  console.log(JSON.stringify({ outputPath, metrics, failureMatrix }, null, 2));
+  console.log(JSON.stringify({ outputPath, metrics, failureMatrix, documentResults }, null, 2));
 }
 
 await run();
