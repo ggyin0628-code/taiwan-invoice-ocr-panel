@@ -42,12 +42,12 @@ function normalizeItems(items) {
 
 function normalizeExpected(expected = {}) {
   return {
-    invoiceNumber: normalizeText(expected.invoiceNumber),
-    buyerTaxId: normalizeText(expected.buyerTaxId ?? expected.taxId),
+    invoiceNumber: normalizeText(expected.invoiceNumber ?? expected.expectedInvoiceNumber),
+    buyerTaxId: normalizeText(expected.buyerTaxId ?? expected.expectedBuyerTaxId ?? expected.taxId),
     items: normalizeItems(expected.items ?? expected.expectedLineItems),
-    salesAmount: normalizeNumber(expected.salesAmount ?? expected.subtotal),
-    taxAmount: normalizeNumber(expected.taxAmount ?? expected.tax),
-    totalAmount: normalizeNumber(expected.totalAmount ?? expected.total)
+    salesAmount: normalizeNumber(expected.salesAmount ?? expected.expectedSalesAmount ?? expected.subtotal),
+    taxAmount: normalizeNumber(expected.taxAmount ?? expected.expectedTaxAmount ?? expected.tax),
+    totalAmount: normalizeNumber(expected.totalAmount ?? expected.expectedTotalAmount ?? expected.total)
   };
 }
 
