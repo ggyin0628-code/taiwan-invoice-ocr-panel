@@ -3,7 +3,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { processInvoiceRecord } from "../lib/server/processInvoice.js";
-import { InvoiceDocument, InvoicePageEvidence } from "../lib/server/invoiceDocument.js";
+import { InvoiceDocument, InvoicePageEvidence, validateDocumentBoundary } from "../lib/server/invoiceDocument.js";
 import { fromDataRelativePath, toDataRelativePath, UPLOADS_DIR } from "../lib/server/paths.js";
 
 const root = process.cwd();
@@ -96,13 +96,14 @@ function loadDocumentGrouping() {
   const documents = Array.isArray(raw) ? raw : raw.documents;
   if (!Array.isArray(documents) || !documents.length) throw new Error(`document grouping schema 不完整：${documentGroupingPath}`);
   const imageToDocument = {};
+  const boundary = validateDocumentBoundary({ documents });
   for (const document of documents) {
     const documentId = String(document.documentId || "");
     const images = document.sourceImageIds || document.sourcePageIds || document.images || [];
     if (!documentId || !Array.isArray(images) || !images.length) throw new Error("document grouping 含無效 document entry");
     for (const image of images) imageToDocument[basename(String(image))] = documentId;
   }
-  return { documents, imageToDocument };
+  return { documents, imageToDocument, boundary };
 }
 
 function loadDocumentGroundTruth() {
@@ -398,6 +399,7 @@ async function run() {
   const documentResults = mergeDocumentResults(grouping, documentTruth, results);
   const metrics = {
     metricSchemaVersion: "r2-recovered-v1",
+    documentBoundary: grouping.boundary,
     imageLevelMetrics: aggregateMetrics(results, "image"),
     documentLevelMetrics: aggregateMetrics(documentResults, "document"),
     totalSamples: results.length,

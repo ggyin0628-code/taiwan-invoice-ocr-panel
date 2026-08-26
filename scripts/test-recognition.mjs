@@ -10,7 +10,7 @@ import { tableLineItemsFromWords } from "../lib/server/anchorExtractor.js";
 import { resolveBuyerTaxIdentity, resolveInvoiceIdentity } from "../lib/server/identityResolver.js";
 import { deriveTargetedInvoiceRoi, hasCredibleInvoiceCandidate } from "../lib/server/targetedInvoiceRecovery.js";
 import { deriveTargetedTableRoi, mergeTargetedTableRecovery, shouldRunTargetedTableRecovery } from "../lib/server/targetedTableRecovery.js";
-import { InvoiceDocument } from "../lib/server/invoiceDocument.js";
+import { InvoiceDocument, validateDocumentBoundary } from "../lib/server/invoiceDocument.js";
 import { probeModel } from "../lib/server/providerHealth.js";
 
 function test(name, fn) {
@@ -394,4 +394,17 @@ test("canonical rows retain row and cell evidence without changing formula", () 
   assert.equal(result.items[0].rowBbox.x2, 3);
   assert.equal(result.items[0].nameEvidence.tokenCount, 1);
   assert.equal(result.amount.value, 14);
+});
+
+test("document boundary rejects duplicate image mappings and accepts complete observations", () => {
+  const boundary = validateDocumentBoundary({ documents: [
+    { documentId: "doc-a", sourceImageIds: ["view-a", "view-b"], observationType: "SINGLE_COMPLETE" },
+    { documentId: "doc-b", sourceImageIds: ["view-c"], observationType: "SINGLE_COMPLETE" }
+  ] });
+  assert.equal(boundary.documentCount, 2);
+  assert.equal(boundary.imageCount, 3);
+  assert.throws(() => validateDocumentBoundary({ documents: [
+    { documentId: "doc-a", sourceImageIds: ["view-a"] },
+    { documentId: "doc-b", sourceImageIds: ["view-a"] }
+  ] }), /multiple documents/);
 });
