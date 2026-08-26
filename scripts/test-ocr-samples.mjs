@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { processInvoiceRecord } from "../lib/server/processInvoice.js";
+import { InvoiceDocument, InvoicePageEvidence } from "../lib/server/invoiceDocument.js";
 import { fromDataRelativePath, toDataRelativePath, UPLOADS_DIR } from "../lib/server/paths.js";
 
 const root = process.cwd();
@@ -321,18 +322,21 @@ function mergeDocumentResults(grouping, documentTruth, imageResults) {
     const pageResults = pageIds.map((page) => byFilename[basename(String(page))]).filter(Boolean);
     const expected = documentTruth[documentId];
     if (!expected) throw new Error(`document ground truth 缺少 ${documentId}`);
-    const mergedItems = mergeDocumentItems(pageResults);
-    const first = pageResults[0] || {};
-    const predicted = {
-      invoiceNumber: first.predicted?.invoiceNumber || "",
-      buyerTaxId: first.predicted?.buyerTaxId || "",
-      items: mergedItems.items,
-      salesAmount: first.predicted?.salesAmount ?? null,
-      taxAmount: first.predicted?.taxAmount ?? null,
-      totalAmount: first.predicted?.totalAmount ?? null
-    };
+    const document = new InvoiceDocument({
+      documentId,
+      pages: pageResults.map((page) => new InvoicePageEvidence({
+        imageId: page.filename,
+        filename: page.filename,
+        observationType: "SINGLE_COMPLETE",
+        predicted: page.predicted,
+        debug: page.debug,
+        performance: page.performance
+      }))
+    });
+    const canonical = document.toCanonical();
+    const predicted = normalizeExpected(canonical);
     const comparison = compareSample(expected, predicted);
-    documents.push({ documentId, sourceImageIds: pageIds.map(String), observationCount: pageResults.length, expected, predicted, comparison, mergeEvidence: mergedItems.provenance });
+    documents.push({ documentId, sourceImageIds: pageIds.map(String), observationCount: pageResults.length, expected, predicted, comparison, mergeEvidence: canonical.mergeEvidence, observationType: canonical.observationType });
   }
   return documents;
 }

@@ -396,66 +396,142 @@ def in_band(cx: float, band: tuple[float, float]) -> bool:
     return band[0] <= cx <= band[1]
 
 
+def _cell_evidence(line: dict[str, Any], value: int | None, column: str, relation: str) -> dict[str, Any]:
+    return {
+        "rawText": str(line.get("text", "")),
+        "normalizedValue": value,
+        "bbox": dict(line.get("box") or {}),
+        "confidence": float(line.get("confidence", 0)),
+        "source": "paddleocr",
+        "column": column,
+        "relation": relation,
+    }
+
+
+def _name_evidence(tokens: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "sourceTokens": [
+            {
+                "rawText": str(token.get("text", "")),
+                "normalizedToken": str(token.get("text", "")).strip(),
+                "bbox": dict(token.get("box") or {}),
+                "confidence": float(token.get("confidence", 0)),
+            }
+            for token in tokens
+        ],
+        "tokenCount": len(tokens),
+        "bboxUnion": _bbox_union(*tokens),
+        "multilineMergeUsed": len(tokens) > 1,
+        "confidence": min((float(token.get("confidence", 0)) for token in tokens), default=0),
+        "reason": "row-local non-numeric tokens within name column" if tokens else "no row-local name token",
+    }
+
+
 def extract_items(lines: list[dict[str, Any]], image_width: int = 1200, image_height: int = 700) -> tuple[list[dict[str, Any]], list[str]]:
     header_y = None
+    header_bottom = None
     lower_y = None
     for line in lines:
-        text = line["text"]
+        text = str(line.get("text", ""))
+        box = line.get("box") or {}
+        y1 = float(box.get("y1", 0))
         if header_y is None and ("数量" in text or "數量" in text or "單價" in text or "单价" in text):
-            header_y = line["box"]["y1"]
-        if header_y is not None and line["box"]["y1"] > header_y and ("營業人蓋用" in text or "营业人盖用" in text or "銷售" in text or "销售" in text):
-            lower_y = line["box"]["y1"]
-            break
+            header_y = y1
+        if header_y is not None and y1 >= header_y:
+            if abs(y1 - header_y) <= max(18, image_height * 0.03):
+                header_bottom = max(header_bottom or 0, float(box.get("y2", 0)))
+            if y1 > header_y and ("營業人蓋用" in text or "营业人盖用" in text or "銷售" in text or "销售" in text or "營業稅" in text or "營業税" in text):
+                lower_y = y1
+                break
     if header_y is None:
-        header_y = 0
-    if lower_y is None:
-        lower_y = 999999
+        return [], []
+    header_bottom = header_bottom or header_y + max(20, image_height * 0.04)
+    lower_y = lower_y or image_height * 0.88
 
     bands = estimate_table_bands(lines, header_y, image_width)
+    row_start = header_y + max(8, image_height * 0.025)
     table_lines = [
         line for line in lines
-        if header_y + max(8, image_height * 0.012) <= line["box"]["y1"] <= lower_y - max(4, image_height * 0.008) and line["box"]["x1"] < image_width * 0.86
+        if float((line.get("box") or {}).get("y1", 0)) >= row_start
+        and float((line.get("box") or {}).get("y1", 0)) <= lower_y - max(4, image_height * 0.008)
+        and float((line.get("box") or {}).get("x1", 0)) < image_width * 0.82
     ]
     rows = group_rows(table_lines)
     items: list[dict[str, Any]] = []
     warnings: list[str] = []
-    for row in rows:
-        name_parts: list[str] = []
+    summary_re = re.compile(r"營業|营业|銷售|销售|稅|税|總|总|合計|合计|零税率|免税|應税|应税|統一發票|统一发票")
+    for row_id, row in enumerate(rows, 1):
+        name_tokens: list[dict[str, Any]] = []
         quantity = None
         unit_price = None
+        quantity_evidence = None
+        unit_price_evidence = None
+        amount_reference = None
         confidences: list[float] = []
-        row_amount_reference = None
+        row_box = _bbox_union(*row)
         for line in row:
-            text = line["text"]
+            text = str(line.get("text", "")).strip()
+            box = line.get("box") or {}
+            if not text or summary_re.search(text):
+                continue
             cx, _ = line_center(line)
+            confidence = float(line.get("confidence", 0))
+            upper = text.upper()
             value = normalized_text_number(text)
-            if cx < image_width * 0.30 and not re.fullmatch(r"[\d,\sIl|L]+", text):
-                name_parts.append(text)
+            mostly_numeric = bool(re.fullmatch(r"[\d\s,./|IlLOSOB>]+", upper))
+            if not mostly_numeric and float(box.get("x1", 0)) < bands["quantity"][1]:
+                trailing = re.search(r"([1-9]\d{0,2})\s*$", text)
+                if trailing and float(box.get("x2", 0)) >= bands["quantity"][0]:
+                    quantity = int(trailing.group(1))
+                    quantity_evidence = _cell_evidence(line, quantity, "quantity", "trailing numeric token overlaps derived quantity band")
+                    confidences.append(confidence)
+                    prefix = text[:trailing.start()].strip()
+                    if prefix:
+                        name_tokens.append({"text": prefix, "box": box, "confidence": confidence})
+                else:
+                    name_tokens.append({"text": text, "box": box, "confidence": confidence})
             elif in_band(cx, bands["quantity"]) and value is not None and 1 <= value <= 999:
                 quantity = value
-                confidences.append(float(line["confidence"]))
+                quantity_evidence = _cell_evidence(line, value, "quantity", "row-local numeric token in derived quantity band")
+                confidences.append(confidence)
             elif in_band(cx, bands["unitPrice"]) and value is not None and value > 0:
                 unit_price = value
-                confidences.append(float(line["confidence"]))
+                unit_price_evidence = _cell_evidence(line, value, "unitPrice", "row-local numeric token in derived unit-price band")
+                confidences.append(confidence)
             elif in_band(cx, bands["amountReference"]) and value is not None and value > 0:
-                row_amount_reference = value
+                amount_reference = _cell_evidence(line, value, "amountReference", "observed amount cross-check; not used as formula input")
         if quantity is None or unit_price is None:
             if quantity is not None or unit_price is not None:
                 warnings.append("數量欄與單價欄筆數不一致，需人工確認")
             continue
         amount = quantity * unit_price
-        if row_amount_reference is not None and abs(row_amount_reference - amount) > max(2, round(amount * 0.02)):
-            warnings.append(f"金額參考欄與公式不一致：{quantity} x {unit_price} = {amount}，參考欄 {row_amount_reference}")
-        name = " ".join(name_parts).strip()[:80] or None
+        if amount_reference and abs(int(amount_reference["normalizedValue"]) - amount) > max(2, round(amount * 0.02)):
+            warnings.append("金額參考欄與公式不一致")
+        name = " ".join(token["text"] for token in name_tokens).strip()[:80] or None
+        name_evidence = _name_evidence(name_tokens)
         confidence = min(confidences) if confidences else 0.5
         items.append(
             {
+                "rowId": f"row-{row_id}",
+                "rowBbox": row_box,
+                "rowType": "named" if name else "numeric_only",
                 "name": name,
+                "nameEvidence": name_evidence,
                 "quantity": quantity,
-                "amount": amount,
+                "quantityEvidence": quantity_evidence,
                 "unitPrice": unit_price,
+                "unitPriceEvidence": unit_price_evidence,
+                "amount": amount,
+                "amountReference": amount_reference,
+                "cells": {
+                    "name": name_evidence,
+                    "quantity": quantity_evidence,
+                    "unitPrice": unit_price_evidence,
+                    "amountReference": amount_reference,
+                },
                 "confidence": confidence,
                 "status": STATUS_CONFIRMED if confidence >= 0.85 else STATUS_NEEDS_REVIEW,
+                "source": "paddleocr",
             }
         )
     return items[:30], warnings

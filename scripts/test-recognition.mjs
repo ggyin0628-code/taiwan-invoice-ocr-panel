@@ -9,6 +9,8 @@ import { REVIEW_STATUS } from "../lib/server/invoiceStatus.js";
 import { tableLineItemsFromWords } from "../lib/server/anchorExtractor.js";
 import { resolveBuyerTaxIdentity, resolveInvoiceIdentity } from "../lib/server/identityResolver.js";
 import { deriveTargetedInvoiceRoi, hasCredibleInvoiceCandidate } from "../lib/server/targetedInvoiceRecovery.js";
+import { deriveTargetedTableRoi, mergeTargetedTableRecovery, shouldRunTargetedTableRecovery } from "../lib/server/targetedTableRecovery.js";
+import { InvoiceDocument } from "../lib/server/invoiceDocument.js";
 import { probeModel } from "../lib/server/providerHealth.js";
 
 function test(name, fn) {
@@ -336,4 +338,60 @@ test("table extraction scales from detected headers", () => {
   assert.equal(result.items[0].quantity, 2);
   assert.equal(result.items[0].unitPrice, 100);
   assert.equal(result.items[0].amount, 200);
+});
+
+test("InvoiceDocument collapses duplicate complete views and retains provenance", () => {
+  const page = (filename) => ({ filename, predicted: {
+    invoiceNumber: "ZZ00000000", buyerTaxId: "11112222", salesAmount: 200, taxAmount: 10, totalAmount: 210,
+    items: [{ itemName: "SYNTHETIC_ITEM", quantity: 2, unitPrice: 100, amount: 200, rowBbox: { x1: 10, y1: 100, x2: 300, y2: 140 }, confidence: 0.9, source: "synthetic", cells: { quantity: {}, unitPrice: {} } }]
+  } });
+  const result = new InvoiceDocument({ documentId: "synthetic-document", pages: [page("view-a"), page("view-b")] }).toCanonical();
+  assert.equal(result.observationType, "MULTIPLE_SINGLE_COMPLETE");
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].agreement, 2);
+  assert.deepEqual(result.items[0].sourcePages.sort(), ["view-a", "view-b"]);
+  assert.equal(result.items[0].conflicts.length, 0);
+  assert.equal(result.salesAmount, 200);
+});
+
+test("InvoiceDocument keeps strong-row conflicts reviewable instead of creating rows", () => {
+  const page = (filename, unitPrice, amount) => ({ filename, predicted: {
+    invoiceNumber: "ZZ00000000", buyerTaxId: "11112222", items: [{ itemName: "SYNTHETIC_CONFLICT", quantity: 1, unitPrice, amount, rowBbox: { x1: 10, y1: 100, x2: 300, y2: 140 } }]
+  } });
+  const result = new InvoiceDocument({ documentId: "synthetic-conflict", pages: [page("view-a", 100, 100), page("view-b", 110, 110)] }).toCanonical();
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].unitPrice, 100);
+  assert.ok(result.items[0].conflicts.some((conflict) => conflict.field === "unitPrice"));
+  assert.equal(result.items[0].sourcePages.length, 2);
+});
+
+test("InvoiceDocument preserves single-image document invariant", () => {
+  const result = new InvoiceDocument({ documentId: "synthetic-single", pages: [{ filename: "single", predicted: { items: [{ itemName: "SINGLE_ITEM", quantity: 1, unitPrice: 7, amount: 7, rowBbox: { x1: 1, y1: 1, x2: 20, y2: 20 } }] } }] }).toCanonical();
+  assert.equal(result.observationType, "SINGLE_COMPLETE");
+  assert.equal(result.observationCount, 1);
+  assert.equal(result.items.length, 1);
+});
+
+test("bounded table ROI uses normalized geometry and only triggers on weak evidence", () => {
+  const roi = deriveTargetedTableRoi({ width: 1200, height: 700 });
+  assert.equal(roi.coordinateSpace, "corrected-image");
+  assert.equal(roi.normalizedGeometry.x, 0.1);
+  assert.equal(shouldRunTargetedTableRecovery({ items: [{ name: "SYNTHETIC_ITEM", rowBbox: {}, cells: {}, quantity: 1, unitPrice: 7 }] }), false);
+  assert.equal(shouldRunTargetedTableRecovery({ items: [{ name: "", rowType: "numeric_only", quantity: 1, unitPrice: 7 }] }), true);
+});
+
+test("targeted table merge keeps the higher-evidence row set", () => {
+  const base = { ok: true, result: { items: [{ name: "", rowType: "numeric_only", quantity: 1, unitPrice: 7 }] }, raw: {} };
+  const recovery = { accepted: true, result: { items: [{ name: "SYNTHETIC_ITEM", quantity: 1, unitPrice: 7, rowBbox: {}, cells: {} }], warnings: [] }, performance: {} };
+  const merged = mergeTargetedTableRecovery(base, recovery);
+  assert.equal(merged.result.items[0].name, "SYNTHETIC_ITEM");
+  assert.equal(merged.targetedTableRecovery.selected, "targeted-table-roi");
+});
+
+test("canonical rows retain row and cell evidence without changing formula", () => {
+  const result = validateInvoiceRecognition({ invoiceNo: "ZZ00000000", buyerTaxId: "11112222", items: [{ itemName: "SYNTHETIC_ITEM", quantity: 2, unitPrice: 7, rowId: "row-1", rowBbox: { x1: 1, y1: 2, x2: 3, y2: 4 }, nameEvidence: { tokenCount: 1 }, cells: { quantity: { column: "quantity" } } }], confidence: 0.9 }, { source: "paddleocr", defaultConfidence: 0.9 });
+  assert.equal(result.items[0].rowId, "row-1");
+  assert.equal(result.items[0].rowBbox.x2, 3);
+  assert.equal(result.items[0].nameEvidence.tokenCount, 1);
+  assert.equal(result.amount.value, 14);
 });

@@ -29,6 +29,8 @@ data/templates/**
 # OCR evaluation data — real invoices and ground truth stay local
 samples-private/
 ground-truth-private.json
+document-ground-truth-private.json
+document-grouping-private.json
 .ocr-benchmark/
 
 # Python cache
