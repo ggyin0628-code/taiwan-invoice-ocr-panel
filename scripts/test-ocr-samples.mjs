@@ -11,10 +11,12 @@ const samplesDir = process.env.OCR_SAMPLES_DIR || join(root, "samples-private");
 const groundTruthPath = process.env.OCR_GROUND_TRUTH || join(root, "ground-truth-private.json");
 const documentGroupingPath = process.env.OCR_DOCUMENT_GROUPING || join(root, "document-grouping-private.json");
 const documentGroundTruthPath = process.env.OCR_DOCUMENT_GROUND_TRUTH || join(root, "document-ground-truth-private.json");
+const financialGroundTruthPath = process.env.OCR_FINANCIAL_CORE_GT || "/home/ubuntu/financial-core-ground-truth-private.json";
 const benchmarkDir = process.env.OCR_BENCHMARK_DIR || join(root, ".ocr-benchmark");
 const supportedImage = /\.(jpe?g|png|webp|tiff?)$/i;
 const scalarFields = ["invoiceNumber", "buyerTaxId", "salesAmount", "taxAmount", "totalAmount"];
 const itemFields = ["itemName", "quantity", "unitPrice", "amount"];
+const financialScalarFields = ["sellerTaxId", "salesAmount", "taxAmount", "totalAmount"];
 const rootCauseLabels = [
   "document detection", "orientation", "perspective correction", "OCR recognition", "layout resolver",
   "field resolver", "row grouping", "invoice number", "tax ID", "quantity", "unit price",
@@ -47,7 +49,13 @@ function normalizeExpected(expected = {}) {
     items: normalizeItems(expected.items ?? expected.expectedLineItems),
     salesAmount: normalizeNumber(expected.salesAmount ?? expected.expectedSalesAmount ?? expected.subtotal),
     taxAmount: normalizeNumber(expected.taxAmount ?? expected.expectedTaxAmount ?? expected.tax),
-    totalAmount: normalizeNumber(expected.totalAmount ?? expected.expectedTotalAmount ?? expected.total)
+    sellerTaxId: normalizeText(expected.sellerTaxId ?? expected.vendorTaxId ?? ""),
+    totalAmount: normalizeNumber(expected.totalAmount ?? expected.expectedTotalAmount ?? expected.total),
+    lineAmounts: Array.isArray(expected.lineAmounts) ? expected.lineAmounts.map(normalizeNumber) : normalizeItems(expected.items ?? expected.expectedLineItems).map((item) => item.amount),
+    quantities: Array.isArray(expected.quantities) ? expected.quantities.map(normalizeNumber) : normalizeItems(expected.items ?? expected.expectedLineItems).map((item) => item.quantity),
+    unitPrices: Array.isArray(expected.unitPrices) ? expected.unitPrices.map(normalizeNumber) : normalizeItems(expected.items ?? expected.expectedLineItems).map((item) => item.unitPrice),
+    financial: expected.financial || null,
+    financialStatus: expected.financialStatus || null
   };
 }
 
@@ -58,7 +66,13 @@ function normalizePredicted(record = {}) {
     items: normalizeItems(record.items),
     salesAmount: normalizeNumber(record.salesAmount ?? record.amount),
     taxAmount: normalizeNumber(record.taxAmount ?? record.tax),
-    totalAmount: normalizeNumber(record.totalAmount ?? record.total)
+    sellerTaxId: normalizeText(record.sellerTaxId ?? record.vendorTaxId ?? ""),
+    totalAmount: normalizeNumber(record.totalAmount ?? record.total),
+    lineAmounts: Array.isArray(record.financial?.lineAmounts) ? record.financial.lineAmounts.map((item) => normalizeNumber(item?.lineAmount ?? item?.amount ?? item)) : normalizeItems(record.items).map((item) => item.amount),
+    quantities: normalizeItems(record.items).map((item) => item.quantity),
+    unitPrices: normalizeItems(record.items).map((item) => item.unitPrice),
+    financial: record.financial || null,
+    financialStatus: record.financialStatus || record.financial?.status || null
   };
 }
 
@@ -113,6 +127,13 @@ function loadDocumentGroundTruth() {
   return Object.fromEntries(documents.map((entry) => [String(entry.documentId), normalizeExpected(entry)]));
 }
 
+function loadFinancialGroundTruth() {
+  const raw = loadJson(financialGroundTruthPath, "financial core ground truth");
+  const documents = Array.isArray(raw) ? raw : raw.documents;
+  if (!Array.isArray(documents) || !documents.length) throw new Error(`financial core ground truth schema 不完整：${financialGroundTruthPath}`);
+  return Object.fromEntries(documents.map((entry) => [String(entry.documentId), normalizeExpected(entry)]));
+}
+
 function sampleFiles() {
   if (!existsSync(samplesDir)) return [];
   return readdirSync(samplesDir)
@@ -149,6 +170,45 @@ function compareItems(expectedItems, predictedItems) {
     completeness: expectedCount ? completeRows / expectedCount : predictedCount === 0 ? 1 : 0,
     missingRows: Math.max(0, expectedCount - predictedCount),
     extraRows: Math.max(0, predictedCount - expectedCount)
+  };
+}
+
+function compareFinancial(expected, predicted, { reviewStatus = "UNKNOWN", processingStatus = "unknown", providerFailure = false } = {}) {
+  const expectedLines = Array.isArray(expected.lineAmounts) ? expected.lineAmounts : [];
+  const predictedLines = Array.isArray(predicted.lineAmounts) ? predicted.lineAmounts : [];
+  const exactLineAmounts = expectedLines.filter((value, index) => predictedLines[index] === value).length;
+  const financialFieldResults = Object.fromEntries(financialScalarFields.map((field) => [field, hasValue(expected[field]) && expected[field] === predicted[field]]));
+  const applicableSummaryFields = ["salesAmount", "taxAmount", "totalAmount"].filter((field) => hasValue(expected[field]));
+  const predictedReconciliation = predicted.financial?.reconciliation || {};
+  const expectedFormulaApplicable = expectedLines.length > 0 && expected.quantities.length === expectedLines.length && expected.unitPrices.length === expectedLines.length && expected.quantities.every((value) => value != null) && expected.unitPrices.every((value) => value != null);
+  const reconciliationA = hasValue(expected.salesAmount) && expectedLines.length > 0 ? predictedReconciliation.lineSumVsSales === "PASS" : null;
+  const reconciliationB = hasValue(expected.salesAmount) && hasValue(expected.taxAmount) && hasValue(expected.totalAmount) ? predictedReconciliation.salesPlusTaxVsTotal === "PASS" : null;
+  const reconciliationC = expectedFormulaApplicable ? (Array.isArray(predictedReconciliation.lineFormulaChecks) && predictedReconciliation.lineFormulaChecks.length === expectedLines.length && predictedReconciliation.lineFormulaChecks.every((check) => check.status === "PASS")) : null;
+  const requiredExact = financialScalarFields.every((field) => !hasValue(expected[field]) || financialFieldResults[field]) && expectedLines.length === predictedLines.length && exactLineAmounts === expectedLines.length;
+  const status = predicted.financialStatus || predicted.financial?.status || reviewStatus;
+  return {
+    fieldResults: financialFieldResults,
+    lineAmounts: {
+      exactRows: exactLineAmounts,
+      expectedRows: expectedLines.length,
+      predictedRows: predictedLines.length,
+      exact: expectedLines.length === predictedLines.length && exactLineAmounts === expectedLines.length,
+      completeness: expectedLines.length ? Math.min(expectedLines.length, predictedLines.length) / expectedLines.length : 1,
+      missingRows: Math.max(0, expectedLines.length - predictedLines.length),
+      extraRows: Math.max(0, predictedLines.length - expectedLines.length)
+    },
+    reconciliation: {
+      lineSumVsSales: predictedReconciliation.lineSumVsSales || "UNAVAILABLE",
+      salesPlusTaxVsTotal: predictedReconciliation.salesPlusTaxVsTotal || "UNAVAILABLE",
+      lineFormulaChecks: Array.isArray(predictedReconciliation.lineFormulaChecks) ? predictedReconciliation.lineFormulaChecks : [],
+      passA: reconciliationA,
+      passB: reconciliationB,
+      passC: reconciliationC,
+      warnings: Array.isArray(predictedReconciliation.warnings) ? predictedReconciliation.warnings : []
+    },
+    status,
+    requiredExact,
+    zeroEdit: requiredExact && status === "AUTO_OK" && reviewStatus === "AUTO_OK" && processingStatus === "done" && !providerFailure
   };
 }
 
@@ -237,7 +297,7 @@ function rootCauseCounts(results) {
 }
 
 function stagePerformanceSummary(results) {
-  const stages = ["intakeMs", "preprocessMs", "localOcrMs", "regionOcrMs", "identityResolverMs", "paddleOcrMs", "targetedRoiPreprocessMs", "targetedRoiOcrMs", "targetedRoiTotalMs", "targetedRoiMs", "targetedTablePreprocessMs", "targetedTableOcrMs", "targetedTableTotalMs", "targetedTableMs", "mergeMs", "totalMs"];
+  const stages = ["intakeMs", "preprocessMs", "localOcrMs", "regionOcrMs", "identityResolverMs", "paddleOcrMs", "financialRoiInvocationCount", "sellerTaxIdRoiLatencyMs", "amountRoiLatencyMs", "summaryRoiLatencyMs", "targetedRoiPreprocessMs", "targetedRoiOcrMs", "targetedRoiTotalMs", "targetedRoiMs", "targetedTablePreprocessMs", "targetedTableOcrMs", "targetedTableTotalMs", "targetedTableMs", "mergeMs", "totalMs"];
   return Object.fromEntries(stages.map((stage) => {
     const values = results.map((result) => Number(result.performance?.[stage])).filter((value) => Number.isFinite(value));
     return [stage, values.length ? { samples: values.length, average: values.reduce((sum, value) => sum + value, 0) / values.length, min: Math.min(...values), max: Math.max(...values) } : null];
@@ -314,7 +374,44 @@ function mergeDocumentItems(pageResults) {
   return { items: merged.map(({ signature, sourcePages, sourceRows, agreement, conflicts, ...item }) => ({ ...item, sourcePages, sourceRows, agreement, conflicts })), provenance };
 }
 
-function mergeDocumentResults(grouping, documentTruth, imageResults) {
+function aggregateFinancialMetrics(results) {
+  const total = results.length;
+  const metric = (field) => {
+    const eligible = results.filter((result) => hasValue(result.financialExpected?.[field]));
+    const correct = eligible.filter((result) => result.financialComparison.fieldResults[field]).length;
+    return { correct, total: eligible.length, accuracy: eligible.length ? correct / eligible.length : null };
+  };
+  const eligibleA = results.filter((result) => result.financialComparison.reconciliation.passA !== null);
+  const eligibleB = results.filter((result) => result.financialComparison.reconciliation.passB !== null);
+  const eligibleC = results.filter((result) => result.financialComparison.reconciliation.passC !== null);
+  const passMetric = (eligible, key) => ({ correct: eligible.filter((result) => result.financialComparison.reconciliation[key]).length, total: eligible.length, accuracy: eligible.length ? eligible.filter((result) => result.financialComparison.reconciliation[key]).length / eligible.length : null });
+  const expectedLineAmounts = results.reduce((sum, result) => sum + result.financialComparison.lineAmounts.expectedRows, 0);
+  const exactLineAmounts = results.reduce((sum, result) => sum + result.financialComparison.lineAmounts.exactRows, 0);
+  const missingRows = results.reduce((sum, result) => sum + result.financialComparison.lineAmounts.missingRows, 0);
+  const extraRows = results.reduce((sum, result) => sum + result.financialComparison.lineAmounts.extraRows, 0);
+  const statusCount = (status) => results.filter((result) => result.financialComparison.status === status).length;
+  return {
+    level: "document",
+    totalDocuments: total,
+    sellerTaxId: metric("sellerTaxId"),
+    lineAmountExact: { correct: exactLineAmounts, total: expectedLineAmounts, accuracy: expectedLineAmounts ? exactLineAmounts / expectedLineAmounts : null },
+    lineAmountCompleteness: { exactDocuments: results.filter((result) => result.financialComparison.lineAmounts.completeness === 1).length, totalDocuments: total, average: total ? results.reduce((sum, result) => sum + result.financialComparison.lineAmounts.completeness, 0) / total : null },
+    salesAmount: metric("salesAmount"),
+    taxAmount: metric("taxAmount"),
+    totalAmount: metric("totalAmount"),
+    reconciliationA: passMetric(eligibleA, "passA"),
+    reconciliationB: passMetric(eligibleB, "passB"),
+    reconciliationC: passMetric(eligibleC, "passC"),
+    missingFinancialLineRows: missingRows,
+    falseFinancialRows: extraRows,
+    autoOkRate: total ? statusCount("AUTO_OK") / total : null,
+    reviewRecommendedRate: total ? statusCount("REVIEW_RECOMMENDED") / total : null,
+    reviewRequiredRate: total ? results.filter((result) => ["REVIEW_REQUIRED", "INVALID"].includes(result.financialComparison.status)).length / total : null,
+    zeroEditFinancialConfirmationRate: total ? results.filter((result) => result.financialComparison.zeroEdit).length / total : null
+  };
+}
+
+function mergeDocumentResults(grouping, documentTruth, financialTruth, imageResults) {
   const byFilename = Object.fromEntries(imageResults.map((result) => [result.filename, result]));
   const documents = [];
   for (const group of grouping.documents) {
@@ -322,7 +419,9 @@ function mergeDocumentResults(grouping, documentTruth, imageResults) {
     const pageIds = group.sourceImageIds || group.sourcePageIds || group.images || [];
     const pageResults = pageIds.map((page) => byFilename[basename(String(page))]).filter(Boolean);
     const expected = documentTruth[documentId];
+    const financialExpected = financialTruth[documentId];
     if (!expected) throw new Error(`document ground truth 缺少 ${documentId}`);
+    if (!financialExpected) throw new Error(`financial core ground truth 缺少 ${documentId}`);
     const document = new InvoiceDocument({
       documentId,
       pages: pageResults.map((page) => new InvoicePageEvidence({
@@ -337,7 +436,12 @@ function mergeDocumentResults(grouping, documentTruth, imageResults) {
     const canonical = document.toCanonical();
     const predicted = normalizeExpected(canonical);
     const comparison = compareSample(expected, predicted);
-    documents.push({ documentId, sourceImageIds: pageIds.map(String), observationCount: pageResults.length, expected, predicted, comparison, mergeEvidence: canonical.mergeEvidence, observationType: canonical.observationType });
+    const financialComparison = compareFinancial(financialExpected, predicted, {
+      reviewStatus: canonical.financialStatus || "UNKNOWN",
+      processingStatus: pageResults.length && pageResults.every((page) => page.processingStatus === "done") ? "done" : "need_review",
+      providerFailure: pageResults.some((page) => page.providerFailure)
+    });
+    documents.push({ documentId, sourceImageIds: pageIds.map(String), observationCount: pageResults.length, expected, financialExpected, predicted, comparison, financialComparison, mergeEvidence: canonical.mergeEvidence, observationType: canonical.observationType });
   }
   return documents;
 }
@@ -351,7 +455,12 @@ function invocationSummary(results) {
     targetedRoiTotal: sum("targetedRoiInvocationCount"),
     targetedTableTotal: sum("targetedTableInvocationCount"),
     samplesWithTargetedRoiRecovery: results.filter((result) => Number(result.performance?.targetedRoiInvocationCount || 0) > 0).length,
-    samplesWithTargetedTableRecovery: results.filter((result) => Number(result.performance?.targetedTableInvocationCount || 0) > 0).length
+    samplesWithTargetedTableRecovery: results.filter((result) => Number(result.performance?.targetedTableInvocationCount || 0) > 0).length,
+    financialRoiTotal: sum("financialRoiInvocationCount"),
+    financialRoiAveragePerSample: total ? sum("financialRoiInvocationCount") / total : 0,
+    sellerTaxIdRoiLatencyMsAverage: total ? sum("sellerTaxIdRoiLatencyMs") / total : 0,
+    amountRoiLatencyMsAverage: total ? sum("amountRoiLatencyMs") / total : 0,
+    summaryRoiLatencyMsAverage: total ? sum("summaryRoiLatencyMs") / total : 0
   };
 }
 
@@ -365,6 +474,7 @@ async function run() {
   const groundTruth = loadGroundTruth();
   const grouping = loadDocumentGrouping();
   const documentTruth = loadDocumentGroundTruth();
+  const financialTruth = loadFinancialGroundTruth();
   const missingTruth = samples.map((samplePath) => basename(samplePath)).filter((filename) => !validGroundTruthEntry(normalizeExpected(groundTruth[filename])));
   if (missingTruth.length) throw new Error(`ground truth 缺少或 schema 不完整：${missingTruth.join(", ")}`);
   const missingGrouping = samples.map((samplePath) => basename(samplePath)).filter((filename) => !grouping.imageToDocument[filename]);
@@ -382,7 +492,7 @@ async function run() {
     const expected = normalizeExpected(groundTruth[filename]);
     const startedAt = performance.now();
     try {
-      const predictedRecord = await processInvoiceRecord(record, { provider: process.env.OCR_PROVIDER || "hybrid" });
+      const predictedRecord = await processInvoiceRecord(record, { provider: process.env.OCR_PROVIDER || "financial-core" });
       const processingMs = performance.now() - startedAt;
       const predicted = normalizePredicted(predictedRecord);
       const comparison = compareSample(expected, predicted);
@@ -396,12 +506,13 @@ async function run() {
     }
   }
   for (const result of results) result.rootCauses = classifyRootCauses(result);
-  const documentResults = mergeDocumentResults(grouping, documentTruth, results);
+  const documentResults = mergeDocumentResults(grouping, documentTruth, financialTruth, results);
   const metrics = {
-    metricSchemaVersion: "r2-recovered-v1",
+    metricSchemaVersion: "financial-core-v1",
     documentBoundary: grouping.boundary,
     imageLevelMetrics: aggregateMetrics(results, "image"),
     documentLevelMetrics: aggregateMetrics(documentResults, "document"),
+    financialCoreMetrics: aggregateFinancialMetrics(documentResults),
     totalSamples: results.length,
     successfullyProcessed: results.filter((result) => result.processingStatus !== "failed").length,
     providerFailures: results.filter((result) => result.providerFailure).length,
@@ -413,8 +524,9 @@ async function run() {
     documentCount: documentResults.length,
     canonicalRowCount: documentResults.reduce((sum, result) => sum + result.expected.items.length, 0)
   };
-  const failureMatrix = results.map((result) => ({ filename: result.filename, documentId: result.documentId, processed: result.processingStatus !== "failed", processingStatus: result.processingStatus, processingMs: result.processingMs, providerStatus: result.providerStatus, reviewStatus: result.reviewStatus, fieldResults: result.comparison.fieldResults, missingFields: result.comparison.missingFields, falsePositiveFields: result.comparison.falsePositiveFields, lineItemExactMatch: result.comparison.items.exactMatch, lineItemCompleteness: result.comparison.items.completeness, missingRows: result.comparison.items.missingRows, extraRows: result.comparison.items.extraRows, performance: result.performance, rootCauses: result.rootCauses, error: result.error || "" }));
-  const output = { generatedAt: new Date().toISOString(), samplesDir, groundTruthPath, documentGroupingPath, documentGroundTruthPath, metrics, failureMatrix, results, documentResults };
+  const failureMatrix = results.map((result) => ({ filename: result.filename, documentId: result.documentId, processed: result.processingStatus !== "failed", processingStatus: result.processingStatus, processingMs: result.processingMs, providerStatus: result.providerStatus, reviewStatus: result.reviewStatus, fieldResults: result.comparison.fieldResults, missingFields: result.comparison.missingFields, falsePositiveFields: result.comparison.falsePositiveFields, lineItemExactMatch: result.comparison.items.exactMatch, lineItemCompleteness: result.comparison.items.completeness, missingRows: result.comparison.items.missingRows, extraRows: result.comparison.items.extraRows, financialStatus: result.predicted.financialStatus || result.predicted.financial?.status || "UNKNOWN", financialFieldsAvailable: Object.fromEntries(financialScalarFields.map((field) => [field, hasValue(result.predicted[field])])), performance: result.performance, rootCauses: result.rootCauses, error: result.error || "" }));
+  const financialFailureMatrix = documentResults.map((result, index) => ({ documentOrdinal: index + 1, observationCount: result.observationCount, processed: result.predicted.financialStatus !== null, financialStatus: result.financialComparison.status, fieldResults: result.financialComparison.fieldResults, lineAmounts: result.financialComparison.lineAmounts, reconciliation: { passA: result.financialComparison.reconciliation.passA, passB: result.financialComparison.reconciliation.passB, passC: result.financialComparison.reconciliation.passC, lineSumVsSales: result.financialComparison.reconciliation.lineSumVsSales, salesPlusTaxVsTotal: result.financialComparison.reconciliation.salesPlusTaxVsTotal, warningCount: result.financialComparison.reconciliation.warnings.length }, zeroEdit: result.financialComparison.zeroEdit }));
+  const output = { generatedAt: new Date().toISOString(), samplesDir, groundTruthPath, documentGroupingPath, documentGroundTruthPath, financialGroundTruthPath, metrics, failureMatrix, financialFailureMatrix, results, documentResults };
   await mkdir(benchmarkDir, { recursive: true });
   const outputPath = join(benchmarkDir, `ocr-results-${output.generatedAt.replace(/[-:.TZ]/g, "").slice(0, 14)}.json`);
   await writeFile(outputPath, `${JSON.stringify(output, null, 2)}\n`, "utf8");

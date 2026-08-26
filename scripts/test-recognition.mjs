@@ -7,6 +7,7 @@ import { processInvoiceRecord } from "../lib/server/processInvoice.js";
 import { validateInvoiceRecognition } from "../lib/server/validateInvoiceRecognition.js";
 import { REVIEW_STATUS } from "../lib/server/invoiceStatus.js";
 import { tableLineItemsFromWords } from "../lib/server/anchorExtractor.js";
+import { buildFinancialCore, extractLineAmounts, extractSummaryAmounts, reconcileFinancials, resolveSellerTaxId } from "../lib/server/financialCore.js";
 import { resolveBuyerTaxIdentity, resolveInvoiceIdentity } from "../lib/server/identityResolver.js";
 import { deriveTargetedInvoiceRoi, hasCredibleInvoiceCandidate } from "../lib/server/targetedInvoiceRecovery.js";
 import { deriveTargetedTableRoi, mergeTargetedTableRecovery, shouldRunTargetedTableRecovery } from "../lib/server/targetedTableRecovery.js";
@@ -407,4 +408,83 @@ test("document boundary rejects duplicate image mappings and accepts complete ob
     { documentId: "doc-a", sourceImageIds: ["view-a"] },
     { documentId: "doc-b", sourceImageIds: ["view-a"] }
   ] }), /multiple documents/);
+});
+
+test("seller tax resolver preserves seller anchor and excludes buyer/invoice collisions", () => {
+  const result = resolveSellerTaxId({
+    words: [
+      { text: "買受人統編", left: 80, top: 150, width: 120, height: 24, confidence: 96 },
+      { text: "12345678", left: 210, top: 152, width: 120, height: 24, confidence: 98 },
+      { text: "營業人", left: 720, top: 270, width: 90, height: 24, confidence: 98 },
+      { text: "87654321", left: 820, top: 272, width: 120, height: 24, confidence: 99 }
+    ],
+    buyerTaxId: "12345678",
+    invoiceNumber: "TT00000001",
+    imageWidth: 1200,
+    imageHeight: 700
+  });
+  assert.equal(result.value, "87654321");
+  assert.equal(result.status, "auto");
+  assert.equal(result.selected.anchorRelationship, "seller-label-same-row");
+  assert.ok(result.evidence.some((candidate) => candidate.normalizedCandidate === "12345678" && candidate.anchorRelationship === "identity-collision-excluded"));
+});
+
+test("financial line amount extraction does not require item-name recognition", () => {
+  const rows = extractLineAmounts({ words: [
+    { text: "品名", left: 100, top: 80, width: 80, height: 24, confidence: 95 },
+    { text: "數量", left: 420, top: 80, width: 70, height: 24, confidence: 95 },
+    { text: "單價", left: 560, top: 80, width: 70, height: 24, confidence: 95 },
+    { text: "金額", left: 760, top: 80, width: 70, height: 24, confidence: 95 },
+    { text: "2", left: 430, top: 150, width: 24, height: 24, confidence: 95 },
+    { text: "100", left: 570, top: 150, width: 50, height: 24, confidence: 95 },
+    { text: "200", left: 770, top: 150, width: 50, height: 24, confidence: 95 }
+  ], imageWidth: 1200, imageHeight: 700 });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].lineAmount, 200);
+  assert.equal(rows[0].itemName, "");
+  assert.equal(rows[0].quantity, 2);
+  assert.equal(rows[0].unitPrice, 100);
+});
+
+test("summary amounts are extracted independently from labels", () => {
+  const summary = extractSummaryAmounts({ words: [
+    { text: "銷售額 200", left: 700, top: 520, width: 180, height: 24, confidence: 95 },
+    { text: "稅額 10", left: 700, top: 555, width: 150, height: 24, confidence: 95 },
+    { text: "總計 210", left: 700, top: 590, width: 160, height: 24, confidence: 95 }
+  ], imageWidth: 1200, imageHeight: 700 });
+  assert.equal(summary.salesAmount.value, 200);
+  assert.equal(summary.taxAmount.value, 10);
+  assert.equal(summary.totalAmount.value, 210);
+});
+
+test("financial status recommends review for missing optional evidence, not item-name failure", () => {
+  const result = validateInvoiceRecognition({
+    invoiceNo: "TT00000001",
+    sellerTaxId: { value: "87654321", confidence: 0.95 },
+    buyerTaxId: "12345678",
+    items: [{ itemName: "", lineAmount: 200, lineAmountEvidence: { confidence: 0.95 }, quantity: null, unitPrice: null }],
+    salesAmount: 200,
+    taxAmount: 10,
+    totalAmount: 210,
+    confidence: 0.95
+  }, { source: "paddleocr", defaultConfidence: 0.95 });
+  assert.equal(result.financialStatus, "REVIEW_RECOMMENDED");
+  assert.equal(result.reviewStatus, "REVIEW_RECOMMENDED");
+  assert.notEqual(result.reviewStatus, "REVIEW_REQUIRED");
+  assert.equal(result.financial.reconciliation.lineSumVsSales, "PASS");
+  assert.equal(result.financial.reconciliation.salesPlusTaxVsTotal, "PASS");
+});
+
+test("financial reconciliation mismatch is never silently accepted", () => {
+  const result = buildFinancialCore({
+    sellerTaxId: { value: "87654321", status: "auto", confidence: 0.95 },
+    buyerTaxId: { value: "12345678", status: "auto", confidence: 0.95 },
+    items: [{ lineAmount: 200, itemName: "" }],
+    salesAmount: { value: 202, status: "auto", confidence: 0.95 },
+    taxAmount: { value: 10, status: "auto", confidence: 0.95 },
+    totalAmount: { value: 212, status: "auto", confidence: 0.95 }
+  });
+  assert.equal(result.reconciliation.lineSumVsSales, "MISMATCH");
+  assert.equal(result.status, "REVIEW_REQUIRED");
+  assert.ok(result.reconciliation.warnings.length > 0);
 });

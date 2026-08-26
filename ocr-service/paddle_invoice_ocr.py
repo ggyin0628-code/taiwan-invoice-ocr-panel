@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from functools import lru_cache
 from typing import Any
@@ -537,28 +538,268 @@ def extract_items(lines: list[dict[str, Any]], image_width: int = 1200, image_he
     return items[:30], warnings
 
 
+def _summary_kind(text: str) -> str | None:
+    value = str(text or "")
+    if re.search(r"稅額|税额|營業稅|营业税|稅金|税金|tax", value, re.I):
+        return "taxAmount"
+    if re.search(r"總計|总计|總額|总额|應收|应收|合計金額|合计金额|total", value, re.I):
+        return "totalAmount"
+    if re.search(r"銷售額|销售额|銷售|销售|小計|小计|subtotal", value, re.I):
+        return "salesAmount"
+    return None
+
+
+def _money_candidates(text: str) -> list[tuple[str, int]]:
+    candidates: list[tuple[str, int]] = []
+    for match in re.finditer(r"\d[\d,]*", str(text or "")):
+        raw = match.group(0)
+        value = number_value(raw)
+        if value is not None and value > 0:
+            candidates.append((raw, value))
+    return candidates
+
+
+def _financial_cell_evidence(line: dict[str, Any], value: int | None, column: str, relation: str) -> dict[str, Any]:
+    return {
+        "rawText": str(line.get("text", "")),
+        "normalizedValue": value,
+        "bbox": dict(line.get("box") or {}),
+        "confidence": float(line.get("confidence", 0)),
+        "source": "paddleocr",
+        "column": column,
+        "relation": relation,
+    }
+
+
+def extract_line_amounts(lines: list[dict[str, Any]], image_width: int = 1200, image_height: int = 700) -> list[dict[str, Any]]:
+    """Extract printed amount-column values without requiring readable item names."""
+    header_words = [line for line in lines if re.search(r"品名|數量|数量|單價|单价|金額|金额|小計|小计|amount", str(line.get("text", "")), re.I)]
+    header_y = min((line_center(line)[1] for line in header_words), default=image_height * 0.30)
+    bands = estimate_table_bands(lines, header_y, image_width)
+    amount_band = bands["amountReference"]
+    quantity_band = bands["quantity"]
+    unit_price_band = bands["unitPrice"]
+    summary_lines = [line for line in lines if _summary_kind(str(line.get("text", ""))) or re.search(r"營業人|营业人|專用章|专用章", str(line.get("text", "")))]
+    summary_y = min((line_center(line)[1] for line in summary_lines if line_center(line)[1] > header_y), default=image_height * 0.80)
+    table_lines = [line for line in lines if header_y + max(18, image_height * 0.025) < line_center(line)[1] < min(image_height * 0.88, summary_y - image_height * 0.01) and line_center(line)[0] < image_width * 0.90]
+    rows = group_rows(table_lines, tolerance=max(14, min(42, round(image_height * 0.04))))
+    extracted: list[dict[str, Any]] = []
+    for row in rows:
+        if any(_summary_kind(str(line.get("text", ""))) for line in row):
+            continue
+        amount_candidates: list[tuple[dict[str, Any], int]] = []
+        quantity_candidates: list[tuple[dict[str, Any], int]] = []
+        unit_price_candidates: list[tuple[dict[str, Any], int]] = []
+        for line in row:
+            cx, _ = line_center(line)
+            for _, value in _money_candidates(str(line.get("text", ""))):
+                if amount_band[0] <= cx <= amount_band[1] and value > 0 and value <= 100000000:
+                    amount_candidates.append((line, value))
+                elif quantity_band[0] <= cx <= quantity_band[1] and 1 <= value <= 999:
+                    quantity_candidates.append((line, value))
+                elif unit_price_band[0] <= cx <= unit_price_band[1] and 0 < value <= 10000000:
+                    unit_price_candidates.append((line, value))
+        if not amount_candidates:
+            continue
+        amount_line, amount = sorted(amount_candidates, key=lambda pair: abs(line_center(pair[0])[0] - (amount_band[0] + amount_band[1]) / 2))[0]
+        quantity = quantity_candidates[0][1] if quantity_candidates else None
+        unit_price = unit_price_candidates[0][1] if unit_price_candidates else None
+        row_box = _bbox_union(*row)
+        name_tokens = [line for line in row if not _money_candidates(str(line.get("text", ""))) and line_center(line)[0] < quantity_band[0]]
+        item_name = " ".join(str(line.get("text", "")).strip() for line in name_tokens).strip()[:80]
+        amount_evidence = _financial_cell_evidence(amount_line, amount, "lineAmount", "row-local numeric token in printed amount column")
+        quantity_evidence = _financial_cell_evidence(quantity_candidates[0][0], quantity, "quantity", "optional row-local quantity evidence") if quantity_candidates else None
+        unit_price_evidence = _financial_cell_evidence(unit_price_candidates[0][0], unit_price, "unitPrice", "optional row-local unit-price evidence") if unit_price_candidates else None
+        confidence = float(amount_line.get("confidence", 0))
+        extracted.append({
+            "lineNo": len(extracted) + 1,
+            "rowId": f"row-{len(extracted) + 1}",
+            "rowBbox": row_box,
+            "rowType": "named" if item_name else "numeric_only",
+            "name": item_name,
+            "itemName": item_name,
+            "quantity": quantity,
+            "unitPrice": unit_price,
+            "lineAmount": amount,
+            "amount": amount,
+            "lineAmountEvidence": amount_evidence,
+            "quantityEvidence": quantity_evidence,
+            "unitPriceEvidence": unit_price_evidence,
+            "evidence": {"amount": amount_evidence, "quantity": quantity_evidence, "unitPrice": unit_price_evidence, "rowBbox": row_box},
+            "cells": {"amount": amount_evidence, "quantity": quantity_evidence, "unitPrice": unit_price_evidence},
+            "confidence": {"lineAmount": confidence, "quantity": float(quantity_evidence.get("confidence", 0)) if quantity_evidence else 0, "unitPrice": float(unit_price_evidence.get("confidence", 0)) if unit_price_evidence else 0, "row": confidence},
+            "status": STATUS_CONFIRMED if confidence >= 0.85 else STATUS_NEEDS_REVIEW,
+            "source": "paddleocr"
+        })
+    return extracted[:30]
+
+
+def extract_summary_amounts(lines: list[dict[str, Any]], image_width: int = 1200, image_height: int = 700) -> dict[str, dict[str, Any] | None]:
+    """Extract summary monetary values independently from bottom labels."""
+    candidates: dict[str, list[dict[str, Any]]] = {"salesAmount": [], "taxAmount": [], "totalAmount": []}
+    for label in lines:
+        kind = _summary_kind(str(label.get("text", "")))
+        if not kind:
+            continue
+        label_x, label_y = line_center(label)
+        for raw, value in _money_candidates(str(label.get("text", ""))):
+            candidates[kind].append({"value": value, "raw": raw, "lines": [label], "relation": "summary-label-inline"})
+        for line in lines:
+            if line is label or _summary_kind(str(line.get("text", ""))):
+                continue
+            line_x, line_y = line_center(line)
+            same_row = abs(line_y - label_y) <= max(24, image_height * 0.045) and line_x >= label_x - 10
+            near_below = 0 < line_y - label_y <= max(60, image_height * 0.09) and abs(line_x - label_x) <= max(320, image_width * 0.30)
+            if not (same_row or near_below) or line_y < image_height * 0.42:
+                continue
+            for raw, value in _money_candidates(str(line.get("text", ""))):
+                candidates[kind].append({"value": value, "raw": raw, "lines": [label, line], "relation": "summary-label-neighbor"})
+    output: dict[str, dict[str, Any] | None] = {"salesAmount": None, "taxAmount": None, "totalAmount": None}
+    for kind, values in candidates.items():
+        if not values:
+            output[kind] = field(None, 0, STATUS_MISSING, [], f"no {kind} label/value candidate")
+            continue
+        distinct = {int(value["value"]) for value in values}
+        evidence = [_financial_cell_evidence(value["lines"][-1], int(value["value"]), kind, value["relation"]) for value in values]
+        if len(distinct) > 1:
+            output[kind] = field(None, min((float(item.get("confidence", 0)) for item in evidence), default=0), STATUS_NEEDS_REVIEW, evidence, f"conflicting {kind} candidates")
+            continue
+        best = sorted(values, key=lambda item: (item["relation"] != "summary-label-inline", -max((float(line.get("confidence", 0)) for line in item["lines"]), default=0)))[0]
+        confidence = min((float(line.get("confidence", 0)) for line in best["lines"]), default=0)
+        output[kind] = field(int(best["value"]), confidence, STATUS_CONFIRMED if confidence >= 0.85 else STATUS_NEEDS_REVIEW, evidence, "summary label and nearby monetary candidate")
+    return output
+
+
+def find_seller_tax_id(lines: list[dict[str, Any]], image_width: int = 1200, image_height: int = 700, buyer_tax_id: dict[str, Any] | None = None, invoice: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Resolve seller/vendor tax ID with seller geometry and collision exclusion."""
+    buyer_value = str((buyer_tax_id or {}).get("value") or "")
+    invoice_digits = digits(str((invoice or {}).get("value") or ""))[-8:]
+    configured = {value for value in re.split(r"[\\s,;]+", os.environ.get("EXCLUDED_SELLER_TAX_IDS", "")) if re.fullmatch(r"\d{8}", value)}
+    seller_labels = [line for line in lines if re.search(r"營業人|营业人|發票專用章|发票专用章|統一發票專用章|统一发票专用章|seller|vendor", str(line.get("text", "")), re.I)]
+    candidates: list[dict[str, Any]] = []
+    for line in lines:
+        for value in _eight_digit_candidates(str(line.get("text", ""))):
+            x, y = line_center(line)
+            relation = "unanchored"
+            relation_score = 0.0
+            for label in seller_labels:
+                lx, ly = line_center(label)
+                if abs(y - ly) <= max(24, image_height * 0.045) and x >= lx - 10:
+                    relation, relation_score = "seller-label-same-row", 0.42
+                    break
+                if 0 < y - ly <= max(70, image_height * 0.10) and abs(x - lx) <= max(300, image_width * 0.28):
+                    relation, relation_score = "seller-label-nearby", 0.32
+            if relation == "unanchored" and x / max(1, image_width) >= 0.58 and y / max(1, image_height) >= 0.28:
+                relation, relation_score = "seller-stamp-or-footer-region", 0.16
+            excluded = value in {buyer_value, invoice_digits} and value != ""
+            known_bonus = 0.12 if value in configured else 0.0
+            score = 0.0 if excluded else min(1.0, 0.38 + relation_score + min(0.20, float(line.get("confidence", 0)) / 100 * 0.20) + known_bonus)
+            candidates.append({"rawCandidate": str(line.get("text", "")), "normalizedCandidate": value, "bbox": dict(line.get("box") or {}), "confidence": float(line.get("confidence", 0)) / 100, "anchorRelationship": "identity-collision-excluded" if excluded else relation, "evidenceScore": round(score, 4), "resolverReason": "candidate excluded because it equals buyer tax ID or invoice digits" if excluded else ("seller/vendor anchor and 8-digit candidate share a row" if relation == "seller-label-same-row" else "seller/vendor geometry candidate")})
+    eligible = [candidate for candidate in candidates if candidate["evidenceScore"] >= 0.70]
+    ranked = sorted(eligible, key=lambda candidate: (candidate["evidenceScore"], candidate["confidence"]), reverse=True)
+    if not ranked:
+        return field(None, 0, STATUS_MISSING, candidates, "seller/vendor tax anchor candidate missing or collided")
+    if len(ranked) > 1 and ranked[0]["normalizedCandidate"] != ranked[1]["normalizedCandidate"] and ranked[0]["evidenceScore"] - ranked[1]["evidenceScore"] < 0.08:
+        return field(None, min(ranked[0]["confidence"], ranked[1]["confidence"]), STATUS_NEEDS_REVIEW, candidates, "multiple seller tax IDs have close evidence scores")
+    selected = ranked[0]
+    return field(selected["normalizedCandidate"], selected["confidence"], STATUS_CONFIRMED if selected["confidence"] >= 0.80 and selected["evidenceScore"] >= 0.78 else STATUS_NEEDS_REVIEW, candidates, selected["resolverReason"])
+
+
+def reconcile_financials(line_items: list[dict[str, Any]], sales_field: dict[str, Any], tax_field: dict[str, Any], total_field: dict[str, Any]) -> dict[str, Any]:
+    tolerance = max(0, int(os.environ.get("FINANCIAL_MONEY_TOLERANCE", "1") or 1))
+    line_values = [int(item["lineAmount"]) for item in line_items if isinstance(item.get("lineAmount"), int)]
+    line_sum = sum(line_values) if line_values else None
+    sales = number_value(str(sales_field.get("value"))) if sales_field.get("value") is not None else None
+    tax = number_value(str(tax_field.get("value"))) if tax_field.get("value") is not None else None
+    total = number_value(str(total_field.get("value"))) if total_field.get("value") is not None else None
+    line_check = "UNAVAILABLE" if line_sum is None or sales is None else "PASS" if abs(line_sum - sales) <= tolerance else "MISMATCH"
+    total_check = "UNAVAILABLE" if sales is None or tax is None or total is None else "PASS" if abs(sales + tax - total) <= tolerance else "MISMATCH"
+    formula_checks = []
+    for index, item in enumerate(line_items, 1):
+        quantity, unit_price, amount = item.get("quantity"), item.get("unitPrice"), item.get("lineAmount")
+        if quantity is None or unit_price is None or amount is None:
+            formula_checks.append({"lineNo": index, "status": "UNAVAILABLE"})
+        else:
+            expected = int(quantity) * int(unit_price)
+            formula_checks.append({"lineNo": index, "status": "PASS" if abs(expected - int(amount)) <= tolerance else "MISMATCH", "expected": expected, "observed": amount})
+    warnings = []
+    if line_check == "MISMATCH": warnings.append("line amount sum does not reconcile to sales amount")
+    if total_check == "MISMATCH": warnings.append("sales amount plus tax does not reconcile to total amount")
+    if any(check["status"] == "MISMATCH" for check in formula_checks): warnings.append("quantity × unit price does not reconcile to line amount")
+    tax_rate = tax / sales if sales and tax is not None else None
+    return {"lineSumVsSales": line_check, "salesPlusTaxVsTotal": total_check, "lineFormulaChecks": formula_checks, "taxPlausibility": "UNAVAILABLE" if tax_rate is None else "PLAUSIBLE" if 0 <= tax_rate <= 1 else "OUTLIER", "taxRate": tax_rate, "tolerance": tolerance, "warnings": warnings}
+
+
+def financial_status(seller_field: dict[str, Any], line_items: list[dict[str, Any]], sales_field: dict[str, Any], tax_field: dict[str, Any], total_field: dict[str, Any], reconciliation: dict[str, Any]) -> str:
+    if not seller_field.get("value") or seller_field.get("status") in {STATUS_MISSING, STATUS_INVALID}:
+        return "REVIEW_REQUIRED"
+    if total_field.get("value") is None or not line_items:
+        return "REVIEW_REQUIRED"
+    if reconciliation["lineSumVsSales"] == "MISMATCH" or reconciliation["salesPlusTaxVsTotal"] == "MISMATCH" or any(check["status"] == "MISMATCH" for check in reconciliation["lineFormulaChecks"]):
+        return "REVIEW_REQUIRED"
+    if sales_field.get("value") is None or tax_field.get("value") is None or reconciliation["lineSumVsSales"] == "UNAVAILABLE" or reconciliation["salesPlusTaxVsTotal"] == "UNAVAILABLE" or any(check["status"] == "UNAVAILABLE" for check in reconciliation["lineFormulaChecks"]):
+        return "REVIEW_RECOMMENDED"
+    if min(float(seller_field.get("confidence", 0)), float(sales_field.get("confidence", 0)), float(tax_field.get("confidence", 0)), float(total_field.get("confidence", 0))) < 0.80:
+        return "REVIEW_RECOMMENDED"
+    if any(item.get("quantity") is None or item.get("unitPrice") is None or not item.get("itemName") for item in line_items):
+        return "REVIEW_RECOMMENDED"
+    return "AUTO_OK"
+
+
 def recognize_invoice(image_path: str) -> dict[str, Any]:
     image = Image.open(image_path)
     lines = run_paddleocr(image_path)
     raw_text = "\n".join(line["text"] for line in lines)
-    items, item_warnings = extract_items(lines, image.width, image.height)
-    subtotal = sum(item["amount"] for item in items if isinstance(item.get("amount"), int)) if items else None
-    tax = round(subtotal * 0.05) if subtotal else None
-    total = subtotal + tax if subtotal and tax is not None else None
+    invoice_field = find_invoice_no(lines, image.height)
+    buyer_field = find_tax_id(lines, image.height)
+    seller_field = find_seller_tax_id(lines, image.width, image.height, buyer_field, invoice_field)
+    line_items = extract_line_amounts(lines, image.width, image.height)
+    item_warnings: list[str] = []
+    if not line_items:
+        legacy_items, legacy_warnings = extract_items(lines, image.width, image.height)
+        line_items = [{**item, "lineNo": index + 1, "lineAmount": item.get("amount"), "source": item.get("source", "paddleocr"), "status": item.get("status", STATUS_NEEDS_REVIEW)} for index, item in enumerate(legacy_items)]
+        item_warnings.extend(legacy_warnings)
+    summary = extract_summary_amounts(lines, image.width, image.height)
+    line_sum = sum(int(item["lineAmount"]) for item in line_items if isinstance(item.get("lineAmount"), int)) if line_items else None
+    sales_field = summary["salesAmount"]
+    if sales_field is None or sales_field.get("value") is None:
+        sales_field = field(line_sum, min((float(item.get("confidence", {}).get("lineAmount", 0)) if isinstance(item.get("confidence"), dict) else 0 for item in line_items), default=0), STATUS_CONFIRMED if line_sum is not None else STATUS_MISSING, [], "sum of observed line amounts")
+    tax_field = summary["taxAmount"]
+    total_field = summary["totalAmount"]
+    reconciliation = reconcile_financials(line_items, sales_field, tax_field, total_field)
+    financial_status_value = financial_status(seller_field, line_items, sales_field, tax_field, total_field, reconciliation)
+    warnings = item_warnings + reconciliation["warnings"]
+    financial = {
+        "lineAmounts": [{"lineNo": item.get("lineNo"), "lineAmount": item.get("lineAmount"), "amount": item.get("amount"), "rowBbox": item.get("rowBbox"), "confidence": (item.get("confidence") or {}).get("lineAmount", 0) if isinstance(item.get("confidence"), dict) else item.get("confidence", 0), "source": item.get("source", "paddleocr"), "evidence": item.get("lineAmountEvidence") or item.get("evidence", {}).get("amount"), "status": item.get("status", STATUS_NEEDS_REVIEW)} for item in line_items],
+        "salesAmount": sales_field,
+        "taxAmount": tax_field,
+        "totalAmount": total_field,
+        "reconciliation": reconciliation,
+        "status": financial_status_value
+    }
     return {
         "ok": True,
         "provider": "paddleocr",
         "rawText": raw_text,
         "lines": lines,
         "fields": {
-            "invoiceNo": find_invoice_no(lines, image.height),
-            "buyerTaxId": find_tax_id(lines, image.height),
-            "items": items,
-            "subtotal": subtotal,
-            "tax": tax,
-            "total": total,
+            "invoiceNo": invoice_field,
+            "sellerTaxId": seller_field,
+            "buyerTaxId": buyer_field,
+            "taxId": buyer_field,
+            "items": line_items,
+            "salesAmount": sales_field,
+            "taxAmount": tax_field,
+            "totalAmount": total_field,
+            "subtotal": sales_field,
+            "tax": tax_field,
+            "total": total_field,
+            "financial": financial,
         },
-        "warnings": item_warnings,
+        "financial": financial,
+        "financialStatus": financial_status_value,
+        "reconciliation": reconciliation,
+        "warnings": warnings,
         "notices": ["PaddleOCR 僅供初步填入，仍需人工確認"],
         "debug": {"imageWidth": image.width, "imageHeight": image.height},
     }

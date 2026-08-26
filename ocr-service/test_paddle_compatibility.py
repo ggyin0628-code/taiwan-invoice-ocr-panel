@@ -1,7 +1,18 @@
 import json
 import sys
 
-from paddle_invoice_ocr import find_invoice_no, find_tax_id, get_engine_health, run_paddleocr
+from paddle_invoice_ocr import (
+    STATUS_CONFIRMED,
+    extract_line_amounts,
+    extract_summary_amounts,
+    find_invoice_no,
+    find_seller_tax_id,
+    find_tax_id,
+    financial_status,
+    get_engine_health,
+    reconcile_financials,
+    run_paddleocr,
+)
 
 
 def main() -> None:
@@ -43,6 +54,31 @@ def main() -> None:
     assert seller_only_result["evidence"]
     assert seller_only_result["evidence"][0]["anchorRelationship"] == "seller-region-excluded"
     assert seller_only_result["evidence"][0]["evidenceScore"] == 0
+    financial_lines = [
+        {"text": "品名", "confidence": 0.95, "box": {"x1": 100, "y1": 80, "x2": 180, "y2": 104}},
+        {"text": "數量", "confidence": 0.95, "box": {"x1": 420, "y1": 80, "x2": 490, "y2": 104}},
+        {"text": "單價", "confidence": 0.95, "box": {"x1": 560, "y1": 80, "x2": 630, "y2": 104}},
+        {"text": "金額", "confidence": 0.95, "box": {"x1": 760, "y1": 80, "x2": 830, "y2": 104}},
+        {"text": "2", "confidence": 0.95, "box": {"x1": 430, "y1": 150, "x2": 454, "y2": 174}},
+        {"text": "100", "confidence": 0.95, "box": {"x1": 570, "y1": 150, "x2": 620, "y2": 174}},
+        {"text": "200", "confidence": 0.95, "box": {"x1": 770, "y1": 150, "x2": 820, "y2": 174}},
+    ]
+    extracted_lines = extract_line_amounts(financial_lines, 1200, 700)
+    assert len(extracted_lines) == 1
+    assert extracted_lines[0]["lineAmount"] == 200
+    assert extracted_lines[0]["itemName"] == ""
+    summary = extract_summary_amounts([
+        {"text": "銷售額 200", "confidence": 0.95, "box": {"x1": 700, "y1": 520, "x2": 880, "y2": 544}},
+        {"text": "稅額 10", "confidence": 0.95, "box": {"x1": 700, "y1": 555, "x2": 850, "y2": 579}},
+        {"text": "總計 210", "confidence": 0.95, "box": {"x1": 700, "y1": 590, "x2": 860, "y2": 614}},
+    ], 1200, 700)
+    assert summary["salesAmount"]["value"] == 200
+    assert summary["taxAmount"]["value"] == 10
+    assert summary["totalAmount"]["value"] == 210
+    reconciliation = reconcile_financials(extracted_lines, summary["salesAmount"], summary["taxAmount"], summary["totalAmount"])
+    assert reconciliation["lineSumVsSales"] == "PASS"
+    assert reconciliation["salesPlusTaxVsTotal"] == "PASS"
+    assert financial_status({"value": "87654321", "status": STATUS_CONFIRMED, "confidence": 0.95}, extracted_lines, summary["salesAmount"], summary["taxAmount"], summary["totalAmount"], reconciliation) == "REVIEW_RECOMMENDED"
     if len(sys.argv) > 1:
         lines = run_paddleocr(sys.argv[1])
         assert lines, "PaddleOCR returned no lines"
