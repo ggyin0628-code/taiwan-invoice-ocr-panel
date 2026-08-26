@@ -13,6 +13,7 @@ const documentGroupingPath = process.env.OCR_DOCUMENT_GROUPING || join(root, "do
 const documentGroundTruthPath = process.env.OCR_DOCUMENT_GROUND_TRUTH || join(root, "document-ground-truth-private.json");
 const financialGroundTruthPath = process.env.OCR_FINANCIAL_CORE_GT || "/home/ubuntu/financial-core-ground-truth-private.json";
 const benchmarkDir = process.env.OCR_BENCHMARK_DIR || join(root, ".ocr-benchmark");
+const financialOnly = String(process.env.OCR_PROVIDER || "").toLowerCase() === "financial-core";
 const supportedImage = /\.(jpe?g|png|webp|tiff?)$/i;
 const scalarFields = ["invoiceNumber", "buyerTaxId", "salesAmount", "taxAmount", "totalAmount"];
 const itemFields = ["itemName", "quantity", "unitPrice", "amount"];
@@ -99,6 +100,7 @@ function loadJson(path, label) {
 }
 
 function loadGroundTruth() {
+  if (financialOnly && !existsSync(groundTruthPath)) return {};
   const raw = loadJson(groundTruthPath, "ground truth");
   if (Array.isArray(raw)) return Object.fromEntries(raw.map((entry) => [entry.filename, entry]));
   if (raw && typeof raw === "object" && raw.entries && typeof raw.entries === "object") return raw.entries;
@@ -121,6 +123,7 @@ function loadDocumentGrouping() {
 }
 
 function loadDocumentGroundTruth() {
+  if (financialOnly && !existsSync(documentGroundTruthPath)) return {};
   const raw = loadJson(documentGroundTruthPath, "document ground truth");
   const documents = Array.isArray(raw) ? raw : raw.documents;
   if (!Array.isArray(documents) || !documents.length) throw new Error(`document ground truth schema 不完整：${documentGroundTruthPath}`);
@@ -418,8 +421,8 @@ function mergeDocumentResults(grouping, documentTruth, financialTruth, imageResu
     const documentId = String(group.documentId);
     const pageIds = group.sourceImageIds || group.sourcePageIds || group.images || [];
     const pageResults = pageIds.map((page) => byFilename[basename(String(page))]).filter(Boolean);
-    const expected = documentTruth[documentId];
     const financialExpected = financialTruth[documentId];
+    const expected = documentTruth[documentId] || (financialOnly ? normalizeExpected({}) : null);
     if (!expected) throw new Error(`document ground truth 缺少 ${documentId}`);
     if (!financialExpected) throw new Error(`financial core ground truth 缺少 ${documentId}`);
     const document = new InvoiceDocument({
@@ -475,7 +478,7 @@ async function run() {
   const grouping = loadDocumentGrouping();
   const documentTruth = loadDocumentGroundTruth();
   const financialTruth = loadFinancialGroundTruth();
-  const missingTruth = samples.map((samplePath) => basename(samplePath)).filter((filename) => !validGroundTruthEntry(normalizeExpected(groundTruth[filename])));
+  const missingTruth = financialOnly ? [] : samples.map((samplePath) => basename(samplePath)).filter((filename) => !validGroundTruthEntry(normalizeExpected(groundTruth[filename])));
   if (missingTruth.length) throw new Error(`ground truth 缺少或 schema 不完整：${missingTruth.join(", ")}`);
   const missingGrouping = samples.map((samplePath) => basename(samplePath)).filter((filename) => !grouping.imageToDocument[filename]);
   if (missingGrouping.length) throw new Error(`document grouping 缺少 image：${missingGrouping.join(", ")}`);
@@ -489,7 +492,7 @@ async function run() {
     const storedPath = join(uploadDir, filename);
     await copyFile(samplePath, storedPath);
     const record = { id: `${batchId}-${results.length + 1}`, batchId, filename, imagePath: toDataRelativePath(storedPath) };
-    const expected = normalizeExpected(groundTruth[filename]);
+    const expected = financialOnly ? normalizeExpected({}) : normalizeExpected(groundTruth[filename]);
     const startedAt = performance.now();
     try {
       const predictedRecord = await processInvoiceRecord(record, { provider: process.env.OCR_PROVIDER || "financial-core" });

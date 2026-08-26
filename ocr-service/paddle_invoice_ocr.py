@@ -551,7 +551,9 @@ def _summary_kind(text: str) -> str | None:
 
 def _money_candidates(text: str) -> list[tuple[str, int]]:
     candidates: list[tuple[str, int]] = []
-    for match in re.finditer(r"\d[\d,]*", str(text or "")):
+    # Numeric-only financial scope: allow bounded OCR glyph confusions, never global text replacement.
+    normalized = str(text or "").translate(str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1", "|": "1", "S": "5", "s": "5", "B": "8", "Z": "2"}))
+    for match in re.finditer(r"\d[\d,]*", normalized):
         raw = match.group(0)
         value = number_value(raw)
         if value is not None and value > 0:
