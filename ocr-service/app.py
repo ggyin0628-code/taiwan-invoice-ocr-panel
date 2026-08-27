@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 
 from paddle_invoice_ocr import get_engine_health, recognize_invoice
@@ -22,13 +22,13 @@ def health():
 
 
 @app.post("/ocr/invoice")
-async def ocr_invoice(file: UploadFile = File(...)):
+async def ocr_invoice(file: UploadFile = File(...), scope: str | None = Form(default=None)):
     suffix = Path(file.filename or "invoice.jpg").suffix or ".jpg"
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
-        result = recognize_invoice(tmp_path)
+        result = recognize_invoice(tmp_path, scope=scope)
         return JSONResponse(result)
     except Exception as exc:  # pragma: no cover - service safety net
         return JSONResponse(

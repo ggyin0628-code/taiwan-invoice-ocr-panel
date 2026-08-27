@@ -636,6 +636,65 @@ def extract_line_amounts(lines: list[dict[str, Any]], image_width: int = 1200, i
     return extracted[:30]
 
 
+def extract_numeric_column(lines: list[dict[str, Any]], image_width: int = 1200, image_height: int = 700, scope: str = "quantity") -> list[dict[str, Any]]:
+    """Extract one numeric table column from a bounded field ROI."""
+    if scope not in {"quantity", "unitPrice"}:
+        return []
+    candidates: list[tuple[dict[str, Any], int]] = []
+    for line in lines:
+        cx, cy = line_center(line)
+        relative_x = cx / max(1, image_width)
+        if cy < image_height * 0.08 or cy > image_height * 0.82:
+            continue
+        text = str(line.get("text", "")).strip()
+        if not re.fullmatch(r"[\d\s,.:>|IlLOSOB]+", text.upper()):
+            continue
+        for raw, value in _money_candidates(text):
+            digits_count = len(digits(raw))
+            if scope == "quantity":
+                accepted = 1 <= value <= 999 and digits_count <= 3 and 0.20 <= relative_x <= 0.82
+            else:
+                accepted = 1 <= value <= 10000000 and 2 <= digits_count <= 8 and 0.18 <= relative_x <= 0.95
+            if accepted:
+                candidates.append((line, int(value)))
+    rows: list[list[tuple[dict[str, Any], int]]] = []
+    tolerance = max(18, image_height * 0.10)
+    for candidate in sorted(candidates, key=lambda pair: line_center(pair[0])[1]):
+        cy = line_center(candidate[0])[1]
+        row = next((row for row in rows if abs(sum(line_center(item[0])[1] for item in row) / len(row) - cy) <= tolerance), None)
+        if row is None:
+            rows.append([candidate])
+        else:
+            row.append(candidate)
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        selected_line, selected_value = sorted(row, key=lambda pair: (float(pair[0].get("confidence", 0)), len(digits(str(pair[1])))), reverse=True)[0]
+        evidence = _financial_cell_evidence(selected_line, selected_value, scope, f"bounded {scope} numeric column ROI row candidate")
+        confidence = float(selected_line.get("confidence", 0))
+        row_box = _bbox_union(*[item[0] for item in row])
+        item = {
+            "lineNo": len(output) + 1,
+            "rowId": f"row-{len(output) + 1}",
+            "rowBbox": row_box,
+            "rowType": "numeric_only",
+            "name": "",
+            "itemName": "",
+            "quantity": selected_value if scope == "quantity" else None,
+            "unitPrice": selected_value if scope == "unitPrice" else None,
+            "lineAmount": None,
+            "amount": None,
+            "lineAmountEvidence": None,
+            "quantityEvidence": evidence if scope == "quantity" else None,
+            "unitPriceEvidence": evidence if scope == "unitPrice" else None,
+            "evidence": {"amount": None, "quantity": evidence if scope == "quantity" else None, "unitPrice": evidence if scope == "unitPrice" else None, "rowBbox": row_box},
+            "confidence": {"lineAmount": 0, "quantity": confidence if scope == "quantity" else 0, "unitPrice": confidence if scope == "unitPrice" else 0, "row": confidence},
+            "status": STATUS_CONFIRMED if confidence >= 0.85 else STATUS_NEEDS_REVIEW,
+            "source": f"paddleocr:{scope}"
+        }
+        output.append(item)
+    return output[:30]
+
+
 def extract_summary_amounts(lines: list[dict[str, Any]], image_width: int = 1200, image_height: int = 700) -> dict[str, dict[str, Any] | None]:
     """Extract summary monetary values independently from bottom labels."""
     candidates: dict[str, list[dict[str, Any]]] = {"salesAmount": [], "taxAmount": [], "totalAmount": []}
@@ -761,7 +820,7 @@ def financial_status(seller_field: dict[str, Any], line_items: list[dict[str, An
     return "AUTO_OK"
 
 
-def recognize_invoice(image_path: str) -> dict[str, Any]:
+def recognize_invoice(image_path: str, scope: str | None = None) -> dict[str, Any]:
     image = Image.open(image_path)
     lines = run_paddleocr(image_path)
     raw_text = "\n".join(line["text"] for line in lines)
@@ -769,6 +828,10 @@ def recognize_invoice(image_path: str) -> dict[str, Any]:
     buyer_field = find_tax_id(lines, image.height)
     seller_field = find_seller_tax_id(lines, image.width, image.height, buyer_field, invoice_field)
     line_items = extract_line_amounts(lines, image.width, image.height)
+    if scope in {"quantity", "unitPrice"}:
+        scoped_items = extract_numeric_column(lines, image.width, image.height, scope)
+        if scoped_items:
+            line_items = scoped_items
     item_warnings: list[str] = []
     if not line_items:
         legacy_items, legacy_warnings = extract_items(lines, image.width, image.height)
