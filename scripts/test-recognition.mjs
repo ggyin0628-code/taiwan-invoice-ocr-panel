@@ -7,7 +7,7 @@ import { processInvoiceRecord } from "../lib/server/processInvoice.js";
 import { validateInvoiceRecognition } from "../lib/server/validateInvoiceRecognition.js";
 import { REVIEW_STATUS } from "../lib/server/invoiceStatus.js";
 import { tableLineItemsFromWords } from "../lib/server/anchorExtractor.js";
-import { buildFinancialCore, extractLineAmounts, extractSummaryAmounts, reconcileFinancials, resolveSellerTaxId } from "../lib/server/financialCore.js";
+import { buildFinancialCore, calculateDeterministicFinancials, extractLineAmounts, extractSummaryAmounts, reconcileFinancials, resolveSellerTaxId } from "../lib/server/financialCore.js";
 import { resolveBuyerTaxIdentity, resolveInvoiceIdentity } from "../lib/server/identityResolver.js";
 import { deriveTargetedInvoiceRoi, hasCredibleInvoiceCandidate } from "../lib/server/targetedInvoiceRecovery.js";
 import { deriveTargetedTableRoi, mergeTargetedTableRecovery, shouldRunTargetedTableRecovery } from "../lib/server/targetedTableRecovery.js";
@@ -487,4 +487,73 @@ test("financial reconciliation mismatch is never silently accepted", () => {
   assert.equal(result.reconciliation.lineSumVsSales, "MISMATCH");
   assert.equal(result.status, "REVIEW_REQUIRED");
   assert.ok(result.reconciliation.warnings.length > 0);
+});
+
+test("financial-core merges scoped quantity and unitPrice candidates into one row", () => {
+  const base = validateProviderCandidate({
+    sellerTaxId: { value: "87654321", confidence: 0.95 },
+    items: [{ lineNo: 1, quantity: null, unitPrice: 100, lineAmount: 200, itemName: "" }]
+  }, { source: "paddleocr", defaultConfidence: 0.95 });
+  const quantityScope = validateProviderCandidate({
+    sellerTaxId: { value: "87654321", confidence: 0.95 },
+    items: [{ lineNo: 1, quantity: 2, unitPrice: null, itemName: "" }]
+  }, { source: "paddleocr", defaultConfidence: 0.95 });
+  const result = mergeInvoiceRecognitionResults({ candidates: [base, quantityScope], mode: "financial-core" });
+  assert.equal(result.recognitionResult.items.length, 1);
+  assert.equal(result.recognitionResult.items[0].quantity.value, 2);
+  assert.equal(result.recognitionResult.items[0].unitPrice.value, 100);
+  assert.equal(result.recognitionResult.items[0].lineAmount.value, 200);
+});
+
+test("deterministic financials use q times u for line and sales, independent of printed amount", () => {
+  const calculated = calculateDeterministicFinancials({
+    items: [{
+      quantity: { value: 2, status: "auto", confidence: 0.95 },
+      unitPrice: { value: 100, status: "auto", confidence: 0.95 },
+      lineAmount: { value: 999, source: "paddleocr", confidence: 0.95 }
+    }],
+    taxRounding: "round",
+    taxPolicyConfirmed: true
+  });
+  assert.equal(calculated.items[0].calculatedLineAmount.value, 200);
+  assert.equal(calculated.salesAmount.value, 200);
+  assert.equal(calculated.items[0].financialVerification.status, "MISMATCH_REVIEW_REQUIRED");
+});
+
+test("printed line matching and mismatch retain explicit secondary verification", () => {
+  const matching = calculateDeterministicFinancials({
+    items: [{ quantity: 2, unitPrice: 100, lineAmount: { value: 200, source: "paddleocr" } }],
+    taxRounding: "round",
+    taxPolicyConfirmed: true
+  });
+  const mismatch = calculateDeterministicFinancials({
+    items: [{ quantity: 2, unitPrice: 100, lineAmount: { value: 201, source: "paddleocr" } }],
+    taxRounding: "round",
+    taxPolicyConfirmed: true
+  });
+  assert.equal(matching.items[0].financialVerification.status, "CALCULATED_VERIFIED");
+  assert.equal(mismatch.items[0].financialVerification.status, "MISMATCH_REVIEW_REQUIRED");
+});
+
+test("unconfirmed tax rounding holds tax and total for review, explicit round calculates both", () => {
+  const held = calculateDeterministicFinancials({ items: [{ quantity: 2, unitPrice: 100 }] });
+  assert.equal(held.salesAmount.value, 200);
+  assert.equal(held.taxAmount.value, null);
+  assert.equal(held.totalAmount.value, null);
+  assert.equal(held.taxPolicyConfirmed, false);
+  const confirmed = calculateDeterministicFinancials({ items: [{ quantity: 2, unitPrice: 100 }], taxRounding: "round", taxPolicyConfirmed: true });
+  assert.equal(confirmed.taxAmount.value, 10);
+  assert.equal(confirmed.totalAmount.value, 210);
+});
+
+test("missing quantity or unit price remains REVIEW_REQUIRED regardless of item name", () => {
+  const result = mergeInvoiceRecognitionResults({
+    candidates: [validateProviderCandidate({
+      sellerTaxId: { value: "87654321", confidence: 0.95 },
+      items: [{ lineNo: 1, itemName: "ignored", quantity: null, unitPrice: 100 }]
+    }, { source: "paddleocr", defaultConfidence: 0.95 })],
+    mode: "financial-core"
+  });
+  assert.equal(result.recognitionResult.financialStatus, "REVIEW_REQUIRED");
+  assert.equal(result.recognitionResult.financialStatus, result.recognitionResult.reviewStatus);
 });

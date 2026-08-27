@@ -4,6 +4,7 @@ import sys
 from paddle_invoice_ocr import (
     STATUS_CONFIRMED,
     extract_line_amounts,
+    extract_numeric_column,
     extract_summary_amounts,
     find_invoice_no,
     find_seller_tax_id,
@@ -79,6 +80,16 @@ def main() -> None:
     assert reconciliation["lineSumVsSales"] == "PASS"
     assert reconciliation["salesPlusTaxVsTotal"] == "PASS"
     assert financial_status({"value": "87654321", "status": STATUS_CONFIRMED, "confidence": 0.95}, extracted_lines, summary["salesAmount"], summary["taxAmount"], summary["totalAmount"], reconciliation) == "REVIEW_RECOMMENDED"
+    quantity_scope = extract_numeric_column([
+        {"text": "2", "confidence": 0.95, "box": {"x1": 20, "y1": 100, "x2": 44, "y2": 124}},
+    ], 100, 300, "quantity")
+    unit_price_scope = extract_numeric_column([
+        {"text": "100", "confidence": 0.95, "box": {"x1": 20, "y1": 100, "x2": 70, "y2": 124}},
+    ], 100, 300, "unitPrice")
+    assert quantity_scope[0]["quantity"] == 2
+    assert quantity_scope[0]["quantityEvidence"]["column"] == "quantity"
+    assert unit_price_scope[0]["unitPrice"] == 100
+    assert unit_price_scope[0]["unitPriceEvidence"]["column"] == "unitPrice"
     if len(sys.argv) > 1:
         lines = run_paddleocr(sys.argv[1])
         assert lines, "PaddleOCR returned no lines"
