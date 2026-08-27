@@ -377,6 +377,80 @@ function mergeDocumentItems(pageResults) {
   return { items: merged.map(({ signature, sourcePages, sourceRows, agreement, conflicts, ...item }) => ({ ...item, sourcePages, sourceRows, agreement, conflicts })), provenance };
 }
 
+function deterministicMetric(expectedValues, predictedValues) {
+  const expected = Array.isArray(expectedValues) ? expectedValues.filter((value) => hasValue(value)) : [];
+  const predicted = Array.isArray(predictedValues) ? predictedValues : [];
+  const correct = expected.reduce((count, value, index) => count + (predicted[index] === value ? 1 : 0), 0);
+  return { correct, total: expected.length, accuracy: expected.length ? correct / expected.length : null };
+}
+
+function compareDeterministicFinancial(expected, predicted) {
+  const calculated = predicted.financial?.calculation || null;
+  const predictedItems = Array.isArray(predicted.items) ? predicted.items : [];
+  const expectedRows = Array.isArray(expected.quantities) ? expected.quantities.filter((value) => hasValue(value)).length : 0;
+  const calculatedLines = Array.isArray(calculated?.calculatedLineAmounts) ? calculated.calculatedLineAmounts : [];
+  const expectedLines = Array.isArray(expected.lineAmounts) ? expected.lineAmounts : [];
+  const exactCalculatedLines = expectedLines.reduce((count, value, index) => count + (calculatedLines[index] === value ? 1 : 0), 0);
+  const formulaSales = predicted.financial?.salesAmount?.source === "formula" && hasValue(predicted.financial?.salesAmount?.value);
+  const formulaTax = predicted.financial?.taxAmount?.source === "formula" && hasValue(predicted.financial?.taxAmount?.value);
+  const formulaTotal = predicted.financial?.totalAmount?.source === "formula" && hasValue(predicted.financial?.totalAmount?.value);
+  const summaryVerification = Array.isArray(calculated?.secondarySummaryVerification) ? calculated.secondarySummaryVerification : [];
+  const lineVerification = Array.isArray(calculated?.secondaryVerification) ? calculated.secondaryVerification : [];
+  return {
+    quantity: deterministicMetric(expected.quantities, predicted.quantities),
+    unitPrice: deterministicMetric(expected.unitPrices, predicted.unitPrices),
+    pair: deterministicMetric(expected.quantities.map((value, index) => `${value}x${expected.unitPrices[index]}`), predicted.quantities.map((value, index) => `${value}x${predicted.unitPrices[index]}`)),
+    calculatedLine: { correct: exactCalculatedLines, total: expectedLines.length, accuracy: expectedLines.length ? exactCalculatedLines / expectedLines.length : null },
+    calculatedSales: { present: formulaSales, correct: formulaSales && predicted.financial.salesAmount.value === expected.salesAmount },
+    calculatedTax: { present: formulaTax, correct: formulaTax && predicted.financial.taxAmount.value === expected.taxAmount },
+    calculatedTotal: { present: formulaTotal, correct: formulaTotal && predicted.financial.totalAmount.value === expected.totalAmount },
+    rowCount: { exact: predictedItems.length === expectedRows, expected: expectedRows, predicted: predictedItems.length, missing: Math.max(0, expectedRows - predictedItems.length), extra: Math.max(0, predictedItems.length - expectedRows) },
+    printedLineVerification: lineVerification,
+    printedSummaryVerification: summaryVerification,
+    taxPolicyConfirmed: calculated?.taxPolicyConfirmed === true,
+    taxRounding: calculated?.taxRounding || null,
+    status: predicted.financialStatus || predicted.financial?.status || "UNKNOWN"
+  };
+}
+
+function aggregateDeterministicPrimaryMetrics(results) {
+  const comparisons = results.map((result) => result.deterministicComparison);
+  const cellMetric = (field) => {
+    const correct = comparisons.reduce((sum, comparison) => sum + comparison[field].correct, 0);
+    const total = comparisons.reduce((sum, comparison) => sum + comparison[field].total, 0);
+    return { correct, total, accuracy: total ? correct / total : null };
+  };
+  const outputMetric = (field) => {
+    const total = comparisons.length;
+    const present = comparisons.filter((comparison) => comparison[field].present).length;
+    const correct = comparisons.filter((comparison) => comparison[field].correct).length;
+    return { correct, present, total, accuracy: total ? correct / total : null };
+  };
+  const statusCount = (status) => comparisons.filter((comparison) => comparison.status === status).length;
+  const verification = comparisons.flatMap((comparison) => [...comparison.printedLineVerification, ...comparison.printedSummaryVerification]);
+  const verificationStatusCounts = Object.fromEntries([...new Set(verification.map((entry) => entry.status).filter(Boolean))].map((status) => [status, verification.filter((entry) => entry.status === status).length]));
+  return {
+    level: "document",
+    totalDocuments: comparisons.length,
+    quantity: cellMetric("quantity"),
+    unitPrice: cellMetric("unitPrice"),
+    quantityUnitPricePair: cellMetric("pair"),
+    calculatedLine: cellMetric("calculatedLine"),
+    calculatedSales: outputMetric("calculatedSales"),
+    calculatedTax: outputMetric("calculatedTax"),
+    calculatedTotal: outputMetric("calculatedTotal"),
+    rowCountExact: { correct: comparisons.filter((comparison) => comparison.rowCount.exact).length, total: comparisons.length, accuracy: comparisons.length ? comparisons.filter((comparison) => comparison.rowCount.exact).length / comparisons.length : null },
+    missingRows: comparisons.reduce((sum, comparison) => sum + comparison.rowCount.missing, 0),
+    falseRows: comparisons.reduce((sum, comparison) => sum + comparison.rowCount.extra, 0),
+    autoOkRate: comparisons.length ? statusCount("AUTO_OK") / comparisons.length : null,
+    reviewRecommendedRate: comparisons.length ? statusCount("REVIEW_RECOMMENDED") / comparisons.length : null,
+    reviewRequiredRate: comparisons.length ? comparisons.filter((comparison) => ["REVIEW_REQUIRED", "INVALID"].includes(comparison.status)).length / comparisons.length : null,
+    taxPolicyConfirmed: comparisons.length ? comparisons.every((comparison) => comparison.taxPolicyConfirmed) : false,
+    taxRoundingPoliciesObserved: [...new Set(comparisons.map((comparison) => comparison.taxRounding).filter(Boolean))],
+    printedVerificationStatusCounts: verificationStatusCounts
+  };
+}
+
 function aggregateFinancialMetrics(results) {
   const total = results.length;
   const metric = (field) => {
@@ -439,12 +513,13 @@ function mergeDocumentResults(grouping, documentTruth, financialTruth, imageResu
     const canonical = document.toCanonical();
     const predicted = normalizeExpected(canonical);
     const comparison = compareSample(expected, predicted);
+    const deterministicComparison = compareDeterministicFinancial(financialExpected, predicted);
     const financialComparison = compareFinancial(financialExpected, predicted, {
       reviewStatus: canonical.financialStatus || "UNKNOWN",
       processingStatus: pageResults.length && pageResults.every((page) => page.processingStatus === "done") ? "done" : "need_review",
       providerFailure: pageResults.some((page) => page.providerFailure)
     });
-    documents.push({ documentId, sourceImageIds: pageIds.map(String), observationCount: pageResults.length, expected, financialExpected, predicted, comparison, financialComparison, mergeEvidence: canonical.mergeEvidence, observationType: canonical.observationType });
+    documents.push({ documentId, sourceImageIds: pageIds.map(String), observationCount: pageResults.length, expected, financialExpected, predicted, comparison, financialComparison, deterministicComparison, mergeEvidence: canonical.mergeEvidence, observationType: canonical.observationType });
   }
   return documents;
 }
@@ -516,6 +591,7 @@ async function run() {
     imageLevelMetrics: aggregateMetrics(results, "image"),
     documentLevelMetrics: aggregateMetrics(documentResults, "document"),
     financialCoreMetrics: aggregateFinancialMetrics(documentResults),
+    deterministicPrimaryMetrics: aggregateDeterministicPrimaryMetrics(documentResults),
     totalSamples: results.length,
     successfullyProcessed: results.filter((result) => result.processingStatus !== "failed").length,
     providerFailures: results.filter((result) => result.providerFailure).length,
